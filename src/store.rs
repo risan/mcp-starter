@@ -523,12 +523,19 @@ impl Inner {
     /// owner does not own was planted by someone else and is refused before either.
     fn load<S: Section>(&self) -> Result<State<S>, StoreError> {
         let read_error = |error| StoreError::new(format!("read {}: {error}", self.path.display()));
-        let mut file = match open_data_file(OpenOptions::new().read(true), &self.path) {
-            Ok(file) => file,
+        let (mut file, metadata) = match open_no_follow(OpenOptions::new().read(true), &self.path) {
+            Ok(opened) => opened,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(State::default()),
             Err(error) => return Err(read_error(error)),
         };
-        let file_uid = file.metadata().map_err(read_error)?.uid();
+
+        // No links left means a save renamed a new file over this one after it was opened:
+        // the inode is still a whole snapshot.
+        if metadata.nlink() > 1 {
+            return Err(read_error(io::Error::other("has more than one link")));
+        }
+
+        let file_uid = metadata.uid();
         let (owner, _) = self.dir_owner()?;
 
         if file_uid != owner {
@@ -629,6 +636,17 @@ impl Inner {
 /// symlink and the file must be a regular file with one link, so a root-run command never
 /// hands a file planted under that name (a link to `/etc/shadow`) to the dir's owner.
 fn open_data_file(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
+    let (file, metadata) = open_no_follow(options, path)?;
+
+    if metadata.nlink() != 1 {
+        return Err(io::Error::other("not a regular file with a single link"));
+    }
+
+    Ok(file)
+}
+
+/// Opens a regular file without following a symlink in the last path component.
+fn open_no_follow(options: &mut OpenOptions, path: &Path) -> io::Result<(File, fs::Metadata)> {
     // O_NONBLOCK keeps a FIFO planted under the name from blocking the open; it changes
     // nothing for a regular file.
     let file = options
@@ -643,11 +661,11 @@ fn open_data_file(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
         })?;
     let metadata = file.metadata()?;
 
-    if !metadata.is_file() || metadata.nlink() != 1 {
-        return Err(io::Error::other("not a regular file with a single link"));
+    if !metadata.is_file() {
+        return Err(io::Error::other("not a regular file"));
     }
 
-    Ok(file)
+    Ok((file, metadata))
 }
 
 /// Sets `mode` on an open file or dir whose mode grants any group or other access.
@@ -817,6 +835,85 @@ mod tests {
         assert!(error.to_string().contains("state.json"), "{error}");
         assert!(error.to_string().contains("symbolic link"), "{error}");
         assert_untouched(&target);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refuses_a_hard_linked_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_outside, target) = outside_target();
+        let store = open(dir.path());
+        fs::hard_link(&target, store.path()).unwrap();
+
+        let error = store.read(|_| ()).await.err().unwrap();
+
+        assert!(error.to_string().contains("state.json"), "{error}");
+        assert!(error.to_string().contains("more than one link"), "{error}");
+        assert_untouched(&target);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refuses_a_state_file_that_is_not_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path());
+        fs::create_dir(store.path()).unwrap();
+
+        let error = store.read(|_| ()).await.err().unwrap();
+
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+    }
+
+    /// A read that opened the file just before a save renamed a new one over it holds an
+    /// inode with no links left. That is still a whole snapshot, so the read must succeed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reads_during_saves_never_fail() {
+        const SAVES: i64 = 300;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = StoreOptions::default();
+        options.hooks.sync_file = Arc::new(|_| Ok(()));
+        let store = Store::<TestSection>::open(dir.path(), options).unwrap();
+        bump_session_rev(&store).await;
+        let saving = Arc::new(AtomicBool::new(true));
+
+        let (inner, still_saving) = (store.inner.clone(), saving.clone());
+        let saver = tokio::task::spawn_blocking(move || {
+            let saved = (0..SAVES).try_for_each(|_| {
+                inner.update::<TestSection, ()>(|state| {
+                    state.section.rev += 1;
+
+                    Change::Write(())
+                })
+            });
+
+            still_saving.store(false, Ordering::SeqCst);
+
+            saved
+        });
+        let inner = store.inner.clone();
+        let reader = tokio::task::spawn_blocking(move || {
+            let (mut reads, mut failures) = (0, Vec::new());
+
+            while saving.load(Ordering::SeqCst) {
+                reads += 1;
+
+                if let Err(error) = inner.load::<TestSection>() {
+                    failures.push(error.to_string());
+                }
+            }
+
+            (reads, failures)
+        });
+
+        saver.await.unwrap().unwrap();
+        let (reads, failures) = reader.await.unwrap();
+
+        assert!(
+            failures.is_empty(),
+            "{} of {reads} reads failed, the first: {}",
+            failures.len(),
+            failures[0]
+        );
+        assert_eq!(session_rev(&store).await, SAVES + 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

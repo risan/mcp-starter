@@ -289,7 +289,8 @@ impl<S> Clone for Store<S> {
 
 impl<S: Section> Store<S> {
     /// Prepares the data directory: created 0700 if missing, tightened to 0700 if it grants
-    /// any group or other access. It does not read the state file.
+    /// group or other read or search access, refused if it grants group or other write
+    /// access. It does not read the state file.
     ///
     /// # Panics
     ///
@@ -321,11 +322,13 @@ impl<S: Section> Store<S> {
             )));
         }
 
-        File::open(dir)
-            .and_then(|opened| tighten(&opened, 0o700))
-            .map_err(|error| {
-                StoreError::new(format!("tighten data dir {}: {error}", dir.display()))
-            })?;
+        let tighten_error = |error: io::Error| {
+            StoreError::new(format!("tighten data dir {}: {error}", dir.display()))
+        };
+        let opened = File::open(dir).map_err(tighten_error)?;
+
+        refuse_if_others_could_write(&opened.metadata().map_err(tighten_error)?, dir, 0o700)?;
+        tighten(&opened, 0o700).map_err(tighten_error)?;
 
         Ok(Store {
             inner: Arc::new(Inner {
@@ -464,15 +467,7 @@ impl Inner {
 
     fn acquire_lock(&self) -> Result<File, StoreError> {
         let lock_path = &self.lock_path;
-        let file = open_data_file(
-            OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .mode(0o600),
-            lock_path,
-        )
-        .map_err(|error| StoreError::new(format!("open {}: {error}", lock_path.display())))?;
+        let file = open_lock_file(lock_path)?;
 
         self.chown_to_dir_owner(&file, lock_path)?;
 
@@ -518,9 +513,9 @@ impl Inner {
         }
     }
 
-    /// Reads the state file, first tightening it to 0600 if it grants any group or other
+    /// Reads the state file, first tightening it to 0600 if it grants group or other read
     /// access, so an imported 0644 file stops exposing its secrets. A file the data dir's
-    /// owner does not own was planted by someone else and is refused before either.
+    /// owner does not own, or one others could write, is refused before either.
     fn load<S: Section>(&self) -> Result<State<S>, StoreError> {
         let read_error = |error| StoreError::new(format!("read {}: {error}", self.path.display()));
         let (mut file, metadata) = match open_no_follow(OpenOptions::new().read(true), &self.path) {
@@ -545,6 +540,7 @@ impl Inner {
             )));
         }
 
+        refuse_if_others_could_write(&metadata, &self.path, 0o600)?;
         tighten(&file, 0o600).map_err(|error| {
             StoreError::new(format!("tighten {}: {error}", self.path.display()))
         })?;
@@ -645,6 +641,44 @@ fn open_data_file(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Opens a lock file in the data dir, creating it 0600 if it is missing.
+fn open_lock_file(path: &Path) -> Result<File, StoreError> {
+    let open_error = |error| StoreError::new(format!("open {}: {error}", path.display()));
+    let file = open_data_file(
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600),
+        path,
+    )
+    .map_err(open_error)?;
+
+    refuse_if_others_could_write(&file.metadata().map_err(open_error)?, path, 0o600)?;
+
+    Ok(file)
+}
+
+/// Group or other write access means another user may have changed the file, or may still
+/// hold it open for writing; a chmod takes neither back, so the owner has to look first.
+fn refuse_if_others_could_write(
+    metadata: &fs::Metadata,
+    path: &Path,
+    private_mode: u32,
+) -> Result<(), StoreError> {
+    let mode = metadata.permissions().mode() & 0o777;
+
+    if mode & 0o022 == 0 {
+        return Ok(());
+    }
+
+    Err(StoreError::new(format!(
+        "{path} is writable by group or others (mode {mode:04o}): another user may have changed it \
+         or may still hold it open for writing. Inspect it, then run `chmod {private_mode:o} {path}`",
+        path = path.display()
+    )))
+}
+
 /// Opens a regular file without following a symlink in the last path component.
 fn open_no_follow(options: &mut OpenOptions, path: &Path) -> io::Result<(File, fs::Metadata)> {
     // O_NONBLOCK keeps a FIFO planted under the name from blocking the open; it changes
@@ -694,15 +728,7 @@ impl Lease {
     /// Takes the exclusive lease on the data dir, or fails when another process holds it.
     pub fn acquire<S: Section>(store: &Store<S>, info: &ServiceInfo) -> Result<Lease, StoreError> {
         let path = store.data_dir().join("session.lock");
-        let file = open_data_file(
-            OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .mode(0o600),
-            &path,
-        )
-        .map_err(|error| StoreError::message(format!("open {}: {error}", path.display())))?;
+        let file = open_lock_file(&path)?;
 
         store.inner.chown_to_dir_owner(&file, &path)?;
 
@@ -785,11 +811,121 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let dir = parent.path().join("data");
         fs::create_dir(&dir).unwrap();
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
 
         open(&dir);
 
         assert_eq!(mode(&dir), 0o700);
+    }
+
+    fn assert_refused_as_writable(error: &StoreError, path: &Path, chmod: &str) {
+        let message = error.to_string();
+
+        assert!(message.contains("writable by group or others"), "{message}");
+        assert!(
+            message.contains(&format!("chmod {chmod} {}", path.display())),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn refuses_a_data_dir_others_could_write() {
+        for loose in [0o777, 0o770, 0o702] {
+            let parent = tempfile::tempdir().unwrap();
+            let dir = parent.path().join("data");
+            fs::create_dir(&dir).unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(loose)).unwrap();
+
+            let error = Store::<TestSection>::open(&dir, StoreOptions::default())
+                .err()
+                .unwrap();
+
+            assert_refused_as_writable(&error, &dir, "700");
+            assert_eq!(mode(&dir), loose, "not tightened");
+        }
+    }
+
+    /// Another user opened a world-writable state file before the server started: tightening
+    /// would leave that user's descriptor writable, so neither the dir nor the file is used.
+    #[test]
+    fn refuses_a_shared_data_dir_with_a_shared_state_file() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("data");
+        fs::create_dir(&dir).unwrap();
+        let (path, content) = plant_state_file(&dir);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = Store::<TestSection>::open(&dir, StoreOptions::default())
+            .err()
+            .unwrap();
+
+        assert_refused_as_writable(&error, &dir, "700");
+        assert_eq!(mode(&dir), 0o777);
+        assert_eq!(mode(&path), 0o666);
+        assert_eq!(fs::read(&path).unwrap(), content);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refuses_a_state_file_others_could_write() {
+        for loose in [0o666, 0o620, 0o602] {
+            let dir = tempfile::tempdir().unwrap();
+            let (path, content) = plant_state_file(dir.path());
+            fs::set_permissions(&path, fs::Permissions::from_mode(loose)).unwrap();
+            let store = open(dir.path());
+            let loaded = Arc::new(AtomicBool::new(false));
+
+            let flag = loaded.clone();
+            let read_error = store
+                .read(move |_| flag.store(true, Ordering::SeqCst))
+                .await
+                .err()
+                .unwrap();
+            let flag = loaded.clone();
+            let update_error = store
+                .update(move |_| {
+                    flag.store(true, Ordering::SeqCst);
+
+                    Change::Write(())
+                })
+                .await
+                .err()
+                .unwrap();
+
+            assert_refused_as_writable(&read_error, &path, "600");
+            assert_refused_as_writable(&update_error, &path, "600");
+            assert!(!loaded.load(Ordering::SeqCst), "nothing was loaded");
+            assert_eq!(mode(&path), loose, "not tightened");
+            assert_eq!(fs::read(&path).unwrap(), content);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refuses_a_state_lock_others_could_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("state.lock");
+        fs::write(&lock, b"").unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o666)).unwrap();
+        let store = open(dir.path());
+
+        let error = store.update(|_| Change::Unchanged(())).await.err().unwrap();
+
+        assert_refused_as_writable(&error, &lock, "600");
+        assert_eq!(mode(&lock), 0o666);
+    }
+
+    #[test]
+    fn refuses_a_session_lock_others_could_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("session.lock");
+        fs::write(&lock, b"").unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o620)).unwrap();
+        let store = open(dir.path());
+
+        let error = Lease::acquire(&store, &INFO).err().unwrap();
+
+        assert_refused_as_writable(&error, &lock, "600");
+        assert_eq!(mode(&lock), 0o620);
     }
 
     #[test]
@@ -817,7 +953,7 @@ mod tests {
         assert_eq!(session_rev(&store).await, 1);
         assert_eq!(mode(store.path()), 0o600);
 
-        fs::set_permissions(store.path(), fs::Permissions::from_mode(0o660)).unwrap();
+        fs::set_permissions(store.path(), fs::Permissions::from_mode(0o640)).unwrap();
         store.update(|_| Change::Unchanged(())).await.unwrap();
 
         assert_eq!(mode(store.path()), 0o600, "an update tightens it too");

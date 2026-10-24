@@ -66,9 +66,12 @@ Everything else keeps mfp's text.
   regular file with one link, so a root-run command cannot hand a planted link's target to the
   data dir's owner. Root hands over only a file that root or the dir's owner already owns; one
   owned by any other uid is refused. `Store::chown_to_dir_owner(path)` applies the same rules.
-- Permissions are tightened, not only set at creation: `Store::open` changes an existing data
-  dir that grants any group or other access to 0700, and every load changes such a
-  `state.json` to 0600 before reading it (an imported 0644 file stops exposing its secrets).
+- Permissions are checked, not only set at creation: `Store::open` changes an existing data
+  dir that grants group or other read or search access to 0700, and every load changes such
+  a `state.json` to 0600 before reading it (an imported 0644 file stops exposing its secrets).
+  Group or other write access on the data dir, `state.json`, `state.lock` or `session.lock`
+  is refused instead, because a chmod cannot revoke a descriptor another user already holds:
+  the error asks the owner to inspect the file, then `chmod 700` the dir or `chmod 600` it.
   `state.json` itself must be a regular file with one link, owned by the data dir's owner; a
   symlink or a file owned by any other uid is refused before it is read or tightened.
 - Tokens are checked against their audience: bearer verification and refresh refuse a token

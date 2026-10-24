@@ -27,8 +27,10 @@ TLS. That decides what it does and does not do:
 - Tokens are opaque and stored only as SHA-256 hashes. Refresh tokens rotate; replaying a used
   one revokes the whole family. A token works only for the resource (`{public URL}/mcp`) it
   was issued for.
-- The data dir stays 0700 and `state.json` 0600: looser modes are tightened when the store
-  opens the dir and reads the file. Its files are never opened through a symlink,
+- The data dir stays 0700 and `state.json` 0600: group or other read access is removed when
+  the store opens the dir and reads the file. Group or other write access is refused instead
+  (another user may have changed the file or still hold it open): inspect the files, then
+  `chmod 700` the dir or `chmod 600` the file. Its files are never opened through a symlink,
   `state.json` must belong to the dir's owner, and a root-run command hands over only a file
   root or that owner already owns, through the open descriptor.
 - No multi-user model, no rate limiting beyond the lockout, no TLS (put it behind a proxy), no

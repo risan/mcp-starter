@@ -1435,7 +1435,7 @@ async fn concurrent_code_replay_revokes_all_before_the_store_lock() {
     let mut hooks = Hooks::default();
     let (arm, flag, count) = (armed.clone(), stalled.clone(), entered.clone());
     hooks.euid = Arc::new(|| 0);
-    hooks.chown = Arc::new(|_, _, _| Ok(()));
+    hooks.chown = Arc::new(|_, _, _, _| Ok(()));
     hooks.dir_owner = Arc::new(move |_| {
         if arm.swap(false, Ordering::SeqCst) {
             count.fetch_add(1, Ordering::SeqCst);

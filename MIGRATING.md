@@ -60,6 +60,11 @@ Everything else keeps mfp's text.
 
 - `unsafe` is confined to `src/sys.rs` (`geteuid`); `Hooks::default().euid` uses it, so mfp can
   drop its own `libc` call and `#![forbid(unsafe_code)]` in `lib.rs` stays valid.
+- `Hooks::chown` gets the open file first (`|file, path, uid, gid|`), and the default changes
+  the owner through that descriptor (`fchown`), never by path. The store opens `state.lock`,
+  `session.lock` and its temp files without following a symlink and refuses anything but a
+  regular file with one link, so a root-run command cannot hand a planted link's target to the
+  data dir's owner. `Store::chown_to_dir_owner(path)` applies the same rule.
 - `Section::KEY` must not be `owner`, `clients` or `tokens`; `Store::open` panics if it is.
 - mcp-starter builds with tracing's `release_max_level_off`, which any binary that depends on it
   inherits.

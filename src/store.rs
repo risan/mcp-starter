@@ -205,7 +205,7 @@ pub enum Change<T> {
 
 type RenameHook = Arc<dyn Fn(&Path, &Path) -> io::Result<()> + Send + Sync>;
 type SyncHook = Arc<dyn Fn(&File) -> io::Result<()> + Send + Sync>;
-type ChownHook = Arc<dyn Fn(&Path, u32, u32) -> io::Result<()> + Send + Sync>;
+type ChownHook = Arc<dyn Fn(&File, &Path, u32, u32) -> io::Result<()> + Send + Sync>;
 type OwnerHook = Arc<dyn Fn(&Path) -> io::Result<(u32, u32)> + Send + Sync>;
 
 /// The file-system calls a test needs to fail, stall or observe.
@@ -217,7 +217,8 @@ pub struct Hooks {
     pub sync_file: SyncHook,
     /// The effective user id of the process.
     pub euid: Arc<dyn Fn() -> u32 + Send + Sync>,
-    /// Changes the owner of a file the store created.
+    /// Changes the owner of a file the store opened, through its descriptor. The path is the
+    /// one the file was opened at, for messages and tests; never chown by it.
     pub chown: ChownHook,
     /// The owner and group of the data directory.
     pub dir_owner: OwnerHook,
@@ -229,7 +230,9 @@ impl Default for Hooks {
             rename: Arc::new(|from, to| fs::rename(from, to)),
             sync_file: Arc::new(|file| file.sync_all()),
             euid: Arc::new(sys::effective_uid),
-            chown: Arc::new(|path, uid, gid| std::os::unix::fs::chown(path, Some(uid), Some(gid))),
+            chown: Arc::new(|file, _, uid, gid| {
+                std::os::unix::fs::fchown(file, Some(uid), Some(gid))
+            }),
             dir_owner: Arc::new(|path| {
                 let metadata = fs::metadata(path)?;
 
@@ -346,9 +349,17 @@ impl<S: Section> Store<S> {
         self.inner.jobs_peak.load(Ordering::SeqCst)
     }
 
-    /// Files a root-run process creates in the data dir belong to the dir's owner.
+    /// Files a root-run process creates in the data dir belong to the dir's owner. The file
+    /// must be a regular file with one link; a symlink is refused, never followed.
     pub fn chown_to_dir_owner(&self, path: &Path) -> Result<(), StoreError> {
-        self.inner.chown_to_dir_owner(path)
+        if (self.inner.options.hooks.euid)() != 0 {
+            return Ok(());
+        }
+
+        let file = open_data_file(OpenOptions::new().read(true), path)
+            .map_err(|error| StoreError::new(format!("open {}: {error}", path.display())))?;
+
+        self.inner.chown_to_dir_owner(&file, path)
     }
 
     /// Decodes the current file. The atomic rename means it never sees a torn write, so it
@@ -445,15 +456,17 @@ impl Inner {
 
     fn acquire_lock(&self) -> Result<File, StoreError> {
         let lock_path = &self.lock_path;
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .mode(0o600)
-            .open(lock_path)
-            .map_err(|error| StoreError::new(format!("open {}: {error}", lock_path.display())))?;
+        let file = open_data_file(
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .mode(0o600),
+            lock_path,
+        )
+        .map_err(|error| StoreError::new(format!("open {}: {error}", lock_path.display())))?;
 
-        self.chown_to_dir_owner(lock_path)?;
+        self.chown_to_dir_owner(&file, lock_path)?;
 
         let deadline = Instant::now() + self.options.lock_wait;
 
@@ -536,14 +549,13 @@ impl Inner {
 
     fn write_temp_and_rename(&self, temp_path: &Path, data: &[u8]) -> Result<(), StoreError> {
         let hooks = &self.options.hooks;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(temp_path)
-            .map_err(|error| StoreError::new(format!("create {}: {error}", temp_path.display())))?;
+        let mut file = open_data_file(
+            OpenOptions::new().write(true).create_new(true).mode(0o600),
+            temp_path,
+        )
+        .map_err(|error| StoreError::new(format!("create {}: {error}", temp_path.display())))?;
 
-        self.chown_to_dir_owner(temp_path)?;
+        self.chown_to_dir_owner(&file, temp_path)?;
 
         file.write_all(data)
             .map_err(|error| StoreError::new(format!("write {}: {error}", temp_path.display())))?;
@@ -555,7 +567,7 @@ impl Inner {
             .map_err(|error| StoreError::new(format!("replace {}: {error}", self.path.display())))
     }
 
-    fn chown_to_dir_owner(&self, path: &Path) -> Result<(), StoreError> {
+    fn chown_to_dir_owner(&self, file: &File, path: &Path) -> Result<(), StoreError> {
         let hooks = &self.options.hooks;
 
         if (hooks.euid)() != 0 {
@@ -566,9 +578,34 @@ impl Inner {
             StoreError::new(format!("inspect data dir {}: {error}", self.dir.display()))
         })?;
 
-        (hooks.chown)(path, uid, gid)
+        (hooks.chown)(file, path, uid, gid)
             .map_err(|error| StoreError::new(format!("chown {}: {error}", path.display())))
     }
+}
+
+/// Opens a file the store keeps in the data dir. The last path component must not be a
+/// symlink and the file must be a regular file with one link, so a root-run command never
+/// hands a file planted under that name (a link to `/etc/shadow`) to the dir's owner.
+fn open_data_file(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
+    // O_NONBLOCK keeps a FIFO planted under the name from blocking the open; it changes
+    // nothing for a regular file.
+    let file = options
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                return io::Error::other("is a symbolic link; refusing to follow it");
+            }
+
+            error
+        })?;
+    let metadata = file.metadata()?;
+
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(io::Error::other("not a regular file with a single link"));
+    }
+
+    Ok(file)
 }
 
 fn random_suffix() -> String {
@@ -588,15 +625,17 @@ impl Lease {
     /// Takes the exclusive lease on the data dir, or fails when another process holds it.
     pub fn acquire<S: Section>(store: &Store<S>, info: &ServiceInfo) -> Result<Lease, StoreError> {
         let path = store.data_dir().join("session.lock");
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .mode(0o600)
-            .open(&path)
-            .map_err(|error| StoreError::message(format!("open {}: {error}", path.display())))?;
+        let file = open_data_file(
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .mode(0o600),
+            &path,
+        )
+        .map_err(|error| StoreError::message(format!("open {}: {error}", path.display())))?;
 
-        store.chown_to_dir_owner(&path)?;
+        store.inner.chown_to_dir_owner(&file, &path)?;
 
         file.try_lock().map_err(|_| {
             StoreError::message(format!(
@@ -818,7 +857,13 @@ mod tests {
         options.hooks.euid = Arc::new(|| 0);
         options.hooks.dir_owner = Arc::new(|_| Ok((1234, 5678)));
         let log = events.clone();
-        options.hooks.chown = Arc::new(move |path, uid, gid| {
+        options.hooks.chown = Arc::new(move |file, path, uid, gid| {
+            assert_eq!(
+                file.metadata().unwrap().ino(),
+                fs::metadata(path).unwrap().ino(),
+                "the descriptor is the file at the path"
+            );
+
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             log.lock()
                 .unwrap()
@@ -843,6 +888,103 @@ mod tests {
         assert!(events[1].starts_with("chown state.json.tmp-"), "{events:?}");
         assert!(events[1].ends_with(" 1234:5678"), "{events:?}");
         assert_eq!(events[2], "rename");
+    }
+
+    /// Root-run options whose chown hook records each call instead of changing an owner.
+    fn recording_root_options() -> (StoreOptions, Arc<Mutex<Vec<String>>>) {
+        let chowned = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut options = StoreOptions::default();
+        options.hooks.euid = Arc::new(|| 0);
+        options.hooks.dir_owner = Arc::new(|_| Ok((1234, 5678)));
+        let log = chowned.clone();
+        options.hooks.chown = Arc::new(move |_, path, _, _| {
+            log.lock().unwrap().push(path.display().to_string());
+
+            Ok(())
+        });
+
+        (options, chowned)
+    }
+
+    /// A file outside the data dir that a planted link points at.
+    fn outside_target() -> (tempfile::TempDir, PathBuf) {
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("shadow");
+        fs::write(&target, b"secret").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+
+        (outside, target)
+    }
+
+    fn assert_untouched(target: &Path) {
+        assert_eq!(fs::read(target).unwrap(), b"secret");
+        assert_eq!(
+            fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refuses_a_symlinked_state_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_outside, target) = outside_target();
+        std::os::unix::fs::symlink(&target, dir.path().join("state.lock")).unwrap();
+        let (options, chowned) = recording_root_options();
+        let store = Store::<TestSection>::open(dir.path(), options).unwrap();
+
+        let error = store.update(|_| Change::Unchanged(())).await.err().unwrap();
+
+        assert!(error.to_string().contains("state.lock"), "{error}");
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        assert!(chowned.lock().unwrap().is_empty(), "{chowned:?}");
+        assert_untouched(&target);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refuses_a_hard_linked_state_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_outside, target) = outside_target();
+        fs::hard_link(&target, dir.path().join("state.lock")).unwrap();
+        let (options, chowned) = recording_root_options();
+        let store = Store::<TestSection>::open(dir.path(), options).unwrap();
+
+        let error = store.update(|_| Change::Unchanged(())).await.err().unwrap();
+
+        assert!(error.to_string().contains("regular file"), "{error}");
+        assert!(chowned.lock().unwrap().is_empty(), "{chowned:?}");
+        assert_untouched(&target);
+    }
+
+    #[test]
+    fn refuses_a_symlinked_session_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_outside, target) = outside_target();
+        std::os::unix::fs::symlink(&target, dir.path().join("session.lock")).unwrap();
+        let (options, chowned) = recording_root_options();
+        let store = Store::<TestSection>::open(dir.path(), options).unwrap();
+
+        let error = Lease::acquire(&store, &INFO).err().unwrap();
+
+        assert!(error.to_string().contains("session.lock"), "{error}");
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        assert!(chowned.lock().unwrap().is_empty(), "{chowned:?}");
+        assert_untouched(&target);
+    }
+
+    #[test]
+    fn chown_to_dir_owner_refuses_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_outside, target) = outside_target();
+        let link = dir.path().join("cookies.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let (options, chowned) = recording_root_options();
+        let store = Store::<TestSection>::open(dir.path(), options).unwrap();
+
+        let error = store.chown_to_dir_owner(&link).err().unwrap();
+
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        assert!(chowned.lock().unwrap().is_empty(), "{chowned:?}");
+        assert_untouched(&target);
     }
 
     #[tokio::test(flavor = "current_thread")]

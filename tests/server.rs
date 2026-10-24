@@ -588,11 +588,12 @@ async fn connection_cap_backpressure() {
 
 #[tokio::test]
 async fn dropped_request_flood_stays_bounded() {
+    let real_euid = Hooks::default().euid;
     let hooks = Hooks {
-        euid: Arc::new(|| {
+        euid: Arc::new(move || {
             std::thread::sleep(Duration::from_millis(8));
 
-            unsafe { libc::geteuid() }
+            real_euid()
         }),
         ..Hooks::default()
     };

@@ -71,7 +71,8 @@ Everything else keeps mfp's text.
   a `state.json` to 0600 before reading it (an imported 0644 file stops exposing its secrets).
   Group or other write access on the data dir, `state.json`, `state.lock` or `session.lock`
   is refused instead, because a chmod cannot revoke a descriptor another user already holds:
-  the error asks the owner to inspect the file, then `chmod 700` the dir or `chmod 600` it.
+  the error asks the owner to stop the service, move the data dir aside and set it up again in
+  a new dir, copying in only checked values (a chmod alone is not enough).
   `state.json` itself must be a regular file with one link, owned by the data dir's owner; a
   symlink or a file owned by any other uid is refused before it is read or tightened.
 - Tokens are checked against their audience: bearer verification and refresh refuse a token

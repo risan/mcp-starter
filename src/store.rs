@@ -330,7 +330,7 @@ impl<S: Section> Store<S> {
         };
         let opened = File::open(dir).map_err(tighten_error)?;
 
-        refuse_if_others_could_write(&opened.metadata().map_err(tighten_error)?, dir, 0o700)?;
+        refuse_if_others_could_write(&opened.metadata().map_err(tighten_error)?, dir)?;
         tighten(&opened, 0o700).map_err(tighten_error)?;
 
         Ok(Store {
@@ -544,7 +544,7 @@ impl Inner {
             )));
         }
 
-        refuse_if_others_could_write(&metadata, &self.path, 0o600)?;
+        refuse_if_others_could_write(&metadata, &self.path)?;
         tighten(&file, 0o600).map_err(|error| {
             StoreError::new(format!("tighten {}: {error}", self.path.display()))
         })?;
@@ -658,18 +658,14 @@ fn open_lock_file(path: &Path) -> Result<File, StoreError> {
     )
     .map_err(open_error)?;
 
-    refuse_if_others_could_write(&file.metadata().map_err(open_error)?, path, 0o600)?;
+    refuse_if_others_could_write(&file.metadata().map_err(open_error)?, path)?;
 
     Ok(file)
 }
 
 /// Group or other write access means another user may have changed the file, or may still
-/// hold it open for writing; a chmod takes neither back, so the owner has to look first.
-fn refuse_if_others_could_write(
-    metadata: &fs::Metadata,
-    path: &Path,
-    private_mode: u32,
-) -> Result<(), StoreError> {
+/// hold it open for writing; a chmod takes neither back, so the owner has to start fresh.
+fn refuse_if_others_could_write(metadata: &fs::Metadata, path: &Path) -> Result<(), StoreError> {
     let mode = metadata.permissions().mode() & 0o777;
 
     if mode & 0o022 == 0 {
@@ -678,7 +674,9 @@ fn refuse_if_others_could_write(
 
     Err(StoreError::new(format!(
         "{path} is writable by group or others (mode {mode:04o}): another user may have changed it \
-         or may still hold it open for writing. Inspect it, then run `chmod {private_mode:o} {path}`",
+         or may still hold it open for writing, and a chmod does not close their descriptor. Stop \
+         the service, move the data dir aside, create a new one (mode 0700, owned by the service \
+         user) and set the service up again, copying in only values you have checked",
         path = path.display()
     )))
 }
@@ -822,14 +820,13 @@ mod tests {
         assert_eq!(mode(&dir), 0o700);
     }
 
-    fn assert_refused_as_writable(error: &StoreError, path: &Path, chmod: &str) {
+    fn assert_refused_as_writable(error: &StoreError, path: &Path) {
         let message = error.to_string();
 
+        assert!(message.contains(&path.display().to_string()), "{message}");
         assert!(message.contains("writable by group or others"), "{message}");
-        assert!(
-            message.contains(&format!("chmod {chmod} {}", path.display())),
-            "{message}"
-        );
+        assert!(message.contains("a chmod does not close"), "{message}");
+        assert!(message.contains("move the data dir aside"), "{message}");
     }
 
     #[test]
@@ -844,7 +841,7 @@ mod tests {
                 .err()
                 .unwrap();
 
-            assert_refused_as_writable(&error, &dir, "700");
+            assert_refused_as_writable(&error, &dir);
             assert_eq!(mode(&dir), loose, "not tightened");
         }
     }
@@ -864,7 +861,7 @@ mod tests {
             .err()
             .unwrap();
 
-        assert_refused_as_writable(&error, &dir, "700");
+        assert_refused_as_writable(&error, &dir);
         assert_eq!(mode(&dir), 0o777);
         assert_eq!(mode(&path), 0o666);
         assert_eq!(fs::read(&path).unwrap(), content);
@@ -896,8 +893,8 @@ mod tests {
                 .err()
                 .unwrap();
 
-            assert_refused_as_writable(&read_error, &path, "600");
-            assert_refused_as_writable(&update_error, &path, "600");
+            assert_refused_as_writable(&read_error, &path);
+            assert_refused_as_writable(&update_error, &path);
             assert!(!loaded.load(Ordering::SeqCst), "nothing was loaded");
             assert_eq!(mode(&path), loose, "not tightened");
             assert_eq!(fs::read(&path).unwrap(), content);
@@ -914,7 +911,7 @@ mod tests {
 
         let error = store.update(|_| Change::Unchanged(())).await.err().unwrap();
 
-        assert_refused_as_writable(&error, &lock, "600");
+        assert_refused_as_writable(&error, &lock);
         assert_eq!(mode(&lock), 0o666);
     }
 
@@ -928,7 +925,7 @@ mod tests {
 
         let error = Lease::acquire(&store, &INFO).err().unwrap();
 
-        assert_refused_as_writable(&error, &lock, "600");
+        assert_refused_as_writable(&error, &lock);
         assert_eq!(mode(&lock), 0o620);
     }
 

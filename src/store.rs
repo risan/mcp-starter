@@ -357,7 +357,8 @@ impl<S: Section> Store<S> {
     }
 
     /// Files a root-run process creates in the data dir belong to the dir's owner. The file
-    /// must be a regular file with one link; a symlink is refused, never followed.
+    /// must be a regular file with one link, owned by root or the dir's owner already; a
+    /// symlink is refused, never followed.
     pub fn chown_to_dir_owner(&self, path: &Path) -> Result<(), StoreError> {
         if (self.inner.options.hooks.euid)() != 0 {
             return Ok(());
@@ -518,7 +519,8 @@ impl Inner {
     }
 
     /// Reads the state file, first tightening it to 0600 if it grants any group or other
-    /// access, so an imported 0644 file stops exposing its secrets.
+    /// access, so an imported 0644 file stops exposing its secrets. A file the data dir's
+    /// owner does not own was planted by someone else and is refused before either.
     fn load<S: Section>(&self) -> Result<State<S>, StoreError> {
         let read_error = |error| StoreError::new(format!("read {}: {error}", self.path.display()));
         let mut file = match open_data_file(OpenOptions::new().read(true), &self.path) {
@@ -526,6 +528,15 @@ impl Inner {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(State::default()),
             Err(error) => return Err(read_error(error)),
         };
+        let file_uid = file.metadata().map_err(read_error)?.uid();
+        let (owner, _) = self.dir_owner()?;
+
+        if file_uid != owner {
+            return Err(StoreError::new(format!(
+                "{} belongs to uid {file_uid}, not the data dir's owner (uid {owner}): refusing to read it",
+                self.path.display()
+            )));
+        }
 
         tighten(&file, 0o600).map_err(|error| {
             StoreError::new(format!("tighten {}: {error}", self.path.display()))
@@ -580,19 +591,37 @@ impl Inner {
             .map_err(|error| StoreError::new(format!("replace {}: {error}", self.path.display())))
     }
 
+    /// Only a file root or the dir's owner already owns is handed over, so a file another
+    /// user planted under a store name is never adopted.
     fn chown_to_dir_owner(&self, file: &File, path: &Path) -> Result<(), StoreError> {
         let hooks = &self.options.hooks;
+        let euid = (hooks.euid)();
 
-        if (hooks.euid)() != 0 {
+        if euid != 0 {
             return Ok(());
         }
 
-        let (uid, gid) = (hooks.dir_owner)(&self.dir).map_err(|error| {
-            StoreError::new(format!("inspect data dir {}: {error}", self.dir.display()))
-        })?;
+        let (uid, gid) = self.dir_owner()?;
+        let file_uid = file
+            .metadata()
+            .map_err(|error| StoreError::new(format!("inspect {}: {error}", path.display())))?
+            .uid();
+
+        if file_uid != uid && file_uid != euid {
+            return Err(StoreError::new(format!(
+                "{} belongs to uid {file_uid}, not the data dir's owner (uid {uid}) or root: refusing to take it over",
+                path.display()
+            )));
+        }
 
         (hooks.chown)(file, path, uid, gid)
             .map_err(|error| StoreError::new(format!("chown {}: {error}", path.display())))
+    }
+
+    fn dir_owner(&self) -> Result<(u32, u32), StoreError> {
+        (self.options.hooks.dir_owner)(&self.dir).map_err(|error| {
+            StoreError::new(format!("inspect data dir {}: {error}", self.dir.display()))
+        })
     }
 }
 
@@ -934,8 +963,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let events = Arc::new(Mutex::new(Vec::<String>::new()));
         let mut options = StoreOptions::default();
+        let owner = sys::effective_uid();
         options.hooks.euid = Arc::new(|| 0);
-        options.hooks.dir_owner = Arc::new(|_| Ok((1234, 5678)));
+        options.hooks.dir_owner = Arc::new(move |_| Ok((owner, 5678)));
         let log = events.clone();
         options.hooks.chown = Arc::new(move |file, path, uid, gid| {
             assert_eq!(
@@ -964,18 +994,26 @@ mod tests {
         let events = events.lock().unwrap();
 
         assert_eq!(events.len(), 3, "{events:?}");
-        assert_eq!(events[0], "chown state.lock 1234:5678");
+        assert_eq!(events[0], format!("chown state.lock {owner}:5678"));
         assert!(events[1].starts_with("chown state.json.tmp-"), "{events:?}");
-        assert!(events[1].ends_with(" 1234:5678"), "{events:?}");
+        assert!(events[1].ends_with(&format!(" {owner}:5678")), "{events:?}");
         assert_eq!(events[2], "rename");
     }
 
-    /// Root-run options whose chown hook records each call instead of changing an owner.
+    /// A uid other than the one running the tests: the owner a fake data dir reports, so the
+    /// files the tests create belong to someone else.
+    fn other_uid() -> u32 {
+        sys::effective_uid() + 1
+    }
+
+    /// Root-run options for a data dir owned by [`other_uid`], whose chown hook records each
+    /// call instead of changing an owner.
     fn recording_root_options() -> (StoreOptions, Arc<Mutex<Vec<String>>>) {
         let chowned = Arc::new(Mutex::new(Vec::<String>::new()));
         let mut options = StoreOptions::default();
+        let other = other_uid();
         options.hooks.euid = Arc::new(|| 0);
-        options.hooks.dir_owner = Arc::new(|_| Ok((1234, 5678)));
+        options.hooks.dir_owner = Arc::new(move |_| Ok((other, other)));
         let log = chowned.clone();
         options.hooks.chown = Arc::new(move |_, path, _, _| {
             log.lock().unwrap().push(path.display().to_string());
@@ -1065,6 +1103,116 @@ mod tests {
         assert!(error.to_string().contains("symbolic link"), "{error}");
         assert!(chowned.lock().unwrap().is_empty(), "{chowned:?}");
         assert_untouched(&target);
+    }
+
+    /// A 0644 state file that the test user owns, holding `rev` 9.
+    fn plant_state_file(dir: &Path) -> (PathBuf, Vec<u8>) {
+        let path = dir.join("state.json");
+        let content = br#"{"test":{"rev":9},"owner":{},"clients":{},"tokens":{}}"#.to_vec();
+        fs::write(&path, &content).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        (path, content)
+    }
+
+    fn assert_refused_as_foreign(error: &StoreError, name: &str) {
+        let message = error.to_string();
+
+        assert!(message.contains(name), "{message}");
+        assert!(
+            message.contains(&format!("belongs to uid {}", sys::effective_uid())),
+            "{message}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refuses_a_state_file_owned_by_someone_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, content) = plant_state_file(dir.path());
+        let other = other_uid();
+        let mut options = StoreOptions::default();
+        options.hooks.euid = Arc::new(move || other);
+        options.hooks.dir_owner = Arc::new(move |_| Ok((other, other)));
+        let store = Store::<TestSection>::open(dir.path(), options).unwrap();
+        let loaded = Arc::new(AtomicBool::new(false));
+
+        let flag = loaded.clone();
+        let read_error = store
+            .read(move |_| flag.store(true, Ordering::SeqCst))
+            .await
+            .err()
+            .unwrap();
+        let flag = loaded.clone();
+        let update_error = store
+            .update(move |_| {
+                flag.store(true, Ordering::SeqCst);
+
+                Change::Write(())
+            })
+            .await
+            .err()
+            .unwrap();
+
+        assert_refused_as_foreign(&read_error, "state.json");
+        assert_refused_as_foreign(&update_error, "state.json");
+        assert!(!loaded.load(Ordering::SeqCst), "nothing was loaded");
+        assert_eq!(fs::read(&path).unwrap(), content);
+        assert_eq!(mode(&path), 0o644, "not tightened");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn root_refuses_a_state_file_owned_by_someone_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, content) = plant_state_file(dir.path());
+        let (options, chowned) = recording_root_options();
+        let store = Store::<TestSection>::open(dir.path(), options).unwrap();
+
+        let error = store.read(|_| ()).await.err().unwrap();
+
+        assert_refused_as_foreign(&error, "state.json");
+        assert!(chowned.lock().unwrap().is_empty(), "{chowned:?}");
+        assert_eq!(fs::read(&path).unwrap(), content);
+        assert_eq!(mode(&path), 0o644, "not tightened");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn root_refuses_a_state_lock_owned_by_someone_else() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("state.lock"), b"").unwrap();
+        let (options, chowned) = recording_root_options();
+        let store = Store::<TestSection>::open(dir.path(), options).unwrap();
+
+        let error = store.update(|_| Change::Unchanged(())).await.err().unwrap();
+
+        assert_refused_as_foreign(&error, "state.lock");
+        assert!(chowned.lock().unwrap().is_empty(), "{chowned:?}");
+    }
+
+    #[test]
+    fn root_refuses_a_session_lock_owned_by_someone_else() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("session.lock"), b"").unwrap();
+        let (options, chowned) = recording_root_options();
+        let store = Store::<TestSection>::open(dir.path(), options).unwrap();
+
+        let error = Lease::acquire(&store, &INFO).err().unwrap();
+
+        assert_refused_as_foreign(&error, "session.lock");
+        assert!(chowned.lock().unwrap().is_empty(), "{chowned:?}");
+    }
+
+    #[test]
+    fn chown_to_dir_owner_refuses_a_file_owned_by_someone_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let cookies = dir.path().join("cookies.json");
+        fs::write(&cookies, b"{}").unwrap();
+        let (options, chowned) = recording_root_options();
+        let store = Store::<TestSection>::open(dir.path(), options).unwrap();
+
+        let error = store.chown_to_dir_owner(&cookies).err().unwrap();
+
+        assert_refused_as_foreign(&error, "cookies.json");
+        assert!(chowned.lock().unwrap().is_empty(), "{chowned:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]

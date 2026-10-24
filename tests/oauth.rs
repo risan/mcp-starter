@@ -1564,9 +1564,10 @@ async fn concurrent_code_replay_revokes_all_before_the_store_lock() {
     let _lift = LiftOnDrop(stalled.clone());
     let mut hooks = Hooks::default();
     let (arm, flag, count) = (armed.clone(), stalled.clone(), entered.clone());
+    let real_dir_owner = Hooks::default().dir_owner;
     hooks.euid = Arc::new(|| 0);
     hooks.chown = Arc::new(|_, _, _, _| Ok(()));
-    hooks.dir_owner = Arc::new(move |_| {
+    hooks.dir_owner = Arc::new(move |path| {
         if arm.swap(false, Ordering::SeqCst) {
             count.fetch_add(1, Ordering::SeqCst);
 
@@ -1575,7 +1576,7 @@ async fn concurrent_code_replay_revokes_all_before_the_store_lock() {
             }
         }
 
-        Ok((0, 0))
+        real_dir_owner(path)
     });
     let rig = support::rig_with(StoreOptions {
         hooks,

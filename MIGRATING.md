@@ -64,11 +64,13 @@ Everything else keeps mfp's text.
   the owner through that descriptor (`fchown`), never by path. The store opens `state.lock`,
   `session.lock` and its temp files without following a symlink and refuses anything but a
   regular file with one link, so a root-run command cannot hand a planted link's target to the
-  data dir's owner. `Store::chown_to_dir_owner(path)` applies the same rule.
+  data dir's owner. Root hands over only a file that root or the dir's owner already owns; one
+  owned by any other uid is refused. `Store::chown_to_dir_owner(path)` applies the same rules.
 - Permissions are tightened, not only set at creation: `Store::open` changes an existing data
   dir that grants any group or other access to 0700, and every load changes such a
   `state.json` to 0600 before reading it (an imported 0644 file stops exposing its secrets).
-  `state.json` itself must be a regular file with one link; a symlink there is refused.
+  `state.json` itself must be a regular file with one link, owned by the data dir's owner; a
+  symlink or a file owned by any other uid is refused before it is read or tightened.
 - Tokens are checked against their audience: bearer verification and refresh refuse a token
   whose `resource` is not this server's (`{public URL}/mcp`), so a state file restored under
   another public URL, or a change of `MFP_MCP_PUBLIC_URL`, signs the clients out and they

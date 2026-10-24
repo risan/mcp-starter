@@ -28,8 +28,9 @@ TLS. That decides what it does and does not do:
   one revokes the whole family. A token works only for the resource (`{public URL}/mcp`) it
   was issued for.
 - The data dir stays 0700 and `state.json` 0600: looser modes are tightened when the store
-  opens the dir and reads the file. Its files are never opened through a symlink, and a
-  root-run command changes their owner through the open descriptor only.
+  opens the dir and reads the file. Its files are never opened through a symlink,
+  `state.json` must belong to the dir's owner, and a root-run command hands over only a file
+  root or that owner already owns, through the open descriptor.
 - No multi-user model, no rate limiting beyond the lockout, no TLS (put it behind a proxy), no
   sessions: every MCP request is stateless.
 - Bounded everything: request bodies (1 MiB for `/mcp`, 64 KiB for OAuth), header size,

@@ -841,6 +841,72 @@ async fn refresh_rotation() {
     );
 }
 
+async fn set_token_resource(rig: &OAuthRig<TestState>, resource: &str) {
+    let resource = resource.to_string();
+
+    rig.store
+        .update(move |state| {
+            for token in state.tokens.values_mut() {
+                token.resource = resource.clone();
+            }
+
+            Change::Write(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn tokens_for_another_resource_rejected() {
+    let rig = support::rig().await;
+    let (client_id, issued, _) = rig.client.full_flow().await;
+
+    set_token_resource(&rig, "https://old.example.com/mcp").await;
+
+    assert!(
+        !rig.valid(&issued.access_token).await,
+        "an access token issued for another resource"
+    );
+
+    let (reply, _) = rig.client.refresh(&client_id, &issued.refresh_token).await;
+
+    assert_eq!(
+        (reply.status, reply.error_code().as_str()),
+        (400, "invalid_grant"),
+        "a refresh token issued for another resource"
+    );
+}
+
+#[tokio::test]
+async fn legacy_tokens_without_resource_accepted() {
+    let rig = support::rig().await;
+    let (client_id, issued, _) = rig.client.full_flow().await;
+
+    set_token_resource(&rig, "").await;
+
+    assert!(rig.valid(&issued.access_token).await);
+
+    let (reply, refreshed) = rig.client.refresh(&client_id, &issued.refresh_token).await;
+    let refreshed = refreshed.unwrap_or_else(|| panic!("refresh: {}", reply.body));
+
+    assert!(rig.valid(&refreshed.access_token).await);
+
+    let state = rig.state().await;
+    let fresh: Vec<_> = state
+        .tokens
+        .values()
+        .filter(|token| !token.rotated)
+        .collect();
+
+    assert!(
+        fresh
+            .iter()
+            .filter(|token| token.expires_at > rig.now())
+            .any(|token| token.resource == format!("{ISSUER}/mcp")),
+        "the refreshed tokens are bound to this server's resource"
+    );
+}
+
 #[tokio::test]
 async fn refresh_wrong_client() {
     let rig = support::rig().await;

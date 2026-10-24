@@ -131,6 +131,33 @@ async fn invalid_token_has_error_param() {
 }
 
 #[tokio::test]
+async fn token_for_another_resource_401() {
+    let rig = support::start().await;
+    let client = rig.mcp().await;
+    let body: Value = serde_json::from_str(TOOLS_LIST).unwrap();
+
+    rig.store
+        .update(|state| {
+            for token in state.tokens.values_mut() {
+                token.resource = "https://old.example.com/mcp".to_string();
+            }
+
+            mcp_starter::store::Change::Write(())
+        })
+        .await
+        .unwrap();
+    let response = client.request(&body).send().await.unwrap();
+
+    assert_eq!(response.status(), 401);
+    assert!(
+        response.headers()["www-authenticate"]
+            .to_str()
+            .unwrap()
+            .contains(r#"error="invalid_token""#)
+    );
+}
+
+#[tokio::test]
 async fn expired_token_has_error_param() {
     let rig = support::start().await;
     let client = rig.mcp().await;

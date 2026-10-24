@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ACCESS_TTL, CodeRecord, OAuth, OAuthError, REFRESH_TTL, delete_family, hash_token,
-    json_response, parse_pairs, prune_tokens, random_token,
+    is_for_resource, json_response, parse_pairs, prune_tokens, random_token,
 };
 use crate::store::{Change, Section, State as StoreState, Token, TokenKind};
 use crate::work::ConnPermit;
@@ -258,7 +258,8 @@ impl<S: Section> OAuth<S> {
 
     /// Rotates a refresh token: one store transaction with a fresh read. Presenting an
     /// already-rotated token revokes the whole family and persists that revocation although
-    /// the answer is an error.
+    /// the answer is an error. A token issued for another resource is refused; one without
+    /// a resource (an older record) is accepted and its new tokens carry this server's.
     async fn rotate_refresh(
         &self,
         refresh_token: String,
@@ -273,11 +274,12 @@ impl<S: Section> OAuth<S> {
 
         let hash = hash_token(&refresh_token);
         let now = self.now();
+        let expected_resource = self.inner.resource.clone();
         let outcome = self
             .inner
             .store
             .update(move |state| {
-                let (record_kind, rotated, family, record_client, expires_at) =
+                let (record_kind, rotated, family, record_client, expires_at, record_resource) =
                     match state.tokens.get(&hash) {
                         Some(record) => (
                             Some(record.kind),
@@ -285,8 +287,16 @@ impl<S: Section> OAuth<S> {
                             record.family.clone(),
                             record.client_id.clone(),
                             record.expires_at,
+                            record.resource.clone(),
                         ),
-                        None => (None, false, String::new(), String::new(), now),
+                        None => (
+                            None,
+                            false,
+                            String::new(),
+                            String::new(),
+                            now,
+                            String::new(),
+                        ),
                     };
 
                 if record_kind != Some(TokenKind::Refresh) {
@@ -305,26 +315,27 @@ impl<S: Section> OAuth<S> {
                 if record_client != client_id
                     || !state.clients.contains_key(&client_id)
                     || now >= expires_at
+                    || !is_for_resource(&record_resource, &expected_resource)
                 {
                     let pruned = prune_tokens(state, now);
 
                     return changed_if(pruned, Err(OAuthError::invalid_grant()));
                 }
 
-                let (scope, resource) = match state.tokens.get_mut(&hash) {
+                let scope = match state.tokens.get_mut(&hash) {
                     Some(record) => {
                         record.rotated = true;
 
-                        (record.scope.clone(), record.resource.clone())
+                        record.scope.clone()
                     }
-                    None => (String::new(), String::new()),
+                    None => String::new(),
                 };
 
                 if let Some(client) = state.clients.get_mut(&client_id) {
                     client.last_used_at = Some(now);
                 }
 
-                let response = issue(state, now, &client_id, &family, &scope, &resource);
+                let response = issue(state, now, &client_id, &family, &scope, &expected_resource);
 
                 prune_tokens(state, now);
 

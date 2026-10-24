@@ -244,21 +244,26 @@ impl<S: Section> OAuth<S> {
         (pending.csrf.len(), pending.codes.len())
     }
 
-    /// Checks a bearer access token against `state.json`.
+    /// Checks a bearer access token against `state.json`. A token issued for another
+    /// resource (the state file of a server at another public URL) is refused.
     pub async fn verify(&self, raw_token: &str) -> Result<TokenInfo, VerifyError> {
         let hash = hash_token(raw_token);
         let now = self.now();
+        let resource = self.inner.resource.clone();
         let info = self
             .inner
             .store
             .read(move |state| {
                 let record = state.tokens.get(&hash)?;
 
-                (record.kind == TokenKind::Access && !record.rotated && now < record.expires_at)
-                    .then(|| TokenInfo {
-                        scope: record.scope.clone(),
-                        expires_at: record.expires_at,
-                    })
+                (record.kind == TokenKind::Access
+                    && !record.rotated
+                    && now < record.expires_at
+                    && is_for_resource(&record.resource, &resource))
+                .then(|| TokenInfo {
+                    scope: record.scope.clone(),
+                    expires_at: record.expires_at,
+                })
             })
             .await
             .map_err(VerifyError::Store)?;
@@ -335,6 +340,11 @@ fn prune_tokens<S>(state: &mut StoreState<S>, now: Timestamp) -> bool {
     });
 
     state.tokens.len() != before
+}
+
+/// Records written before tokens carried a resource have none; they stay valid.
+fn is_for_resource(record_resource: &str, resource: &str) -> bool {
+    record_resource.is_empty() || record_resource == resource
 }
 
 fn delete_family<S>(state: &mut StoreState<S>, family: &str) -> bool {

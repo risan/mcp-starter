@@ -227,19 +227,34 @@ static MFP_INFO: ServiceInfo = ServiceInfo {
     favicon: &[],
 };
 
+/// The public URL the fixture's tokens were issued under (resource `{FIXTURE_ISSUER}/mcp`).
+const FIXTURE_ISSUER: &str = "https://mfp.example.com";
+
+fn mfp_oauth(store: &Store<MfpSection>, issuer: &str) -> OAuth<MfpSection> {
+    let clock = TestClock::new("2026-10-24T09:00:00Z");
+
+    OAuth::new(
+        &MFP_INFO,
+        store.clone(),
+        issuer,
+        clock.as_clock(),
+        bcrypt_checker(),
+        Work::new(TaskTracker::new()),
+    )
+}
+
+#[tokio::test]
+async fn go_fixture_token_refused_under_another_public_url() {
+    let (_dir, store) = open_with_fixture("go-state-full.json");
+    let oauth = mfp_oauth(&store, ISSUER);
+
+    assert!(oauth.verify("fixture-access-token-full").await.is_err());
+}
+
 #[tokio::test]
 async fn go_fixture_token_verifies() {
     let (_dir, store) = open_with_fixture("go-state-full.json");
-    let clock = TestClock::new("2026-10-24T09:00:00Z");
-    let work = Work::new(TaskTracker::new());
-    let oauth = OAuth::new(
-        &MFP_INFO,
-        store.clone(),
-        ISSUER,
-        clock.as_clock(),
-        bcrypt_checker(),
-        work,
-    );
+    let oauth = mfp_oauth(&store, FIXTURE_ISSUER);
 
     let info = oauth.verify("fixture-access-token-full").await.unwrap();
 

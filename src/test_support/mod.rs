@@ -7,12 +7,20 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::Router;
 use jiff::{SignedDuration, Timestamp};
+use rmcp::ServerHandler;
+use tokio::net::TcpListener;
 
 use crate::Clock;
 pub use crate::http::install_crypto_provider;
+use crate::server::mcp_service;
+use jsonrpc::McpClient;
 
+pub mod jsonrpc;
 pub mod oauth_flow;
+pub mod server_rig;
+pub mod tls;
 
 /// A clock a test moves by hand.
 #[derive(Clone)]
@@ -96,4 +104,26 @@ pub async fn raw_http(
         .unwrap_or(0);
 
     (status, text)
+}
+
+/// The MCP endpoint over real HTTP on a bare router (no bearer, no body layer), for tests of
+/// a tool handler alone. The client has already sent `initialize`.
+pub async fn serve_mcp<H, F>(tools: F) -> McpClient
+where
+    H: ServerHandler + Send + 'static,
+    F: Fn() -> H + Send + Sync + 'static,
+{
+    let router = Router::new().route_service("/mcp", mcp_service("https://mcp.example.com", tools));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let client = McpClient::new(&format!("http://{address}/mcp"));
+
+    client.initialize().await;
+
+    client
 }

@@ -159,9 +159,9 @@ struct Inner<S> {
     checker: PasswordChecker,
     work: Arc<Work>,
     pending: Mutex<PendingState>,
-    /// Held across the lockout check, the password check and its bookkeeping (D47).
+    /// Held across the lockout check, the password check and its bookkeeping.
     password_lock: tokio::sync::Mutex<()>,
-    /// Held from the code lookup through the store commit that issues the tokens (D50).
+    /// Held from the code lookup through the store commit that issues the tokens.
     grant_lock: tokio::sync::Mutex<()>,
 }
 

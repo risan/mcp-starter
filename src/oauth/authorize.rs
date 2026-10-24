@@ -275,7 +275,7 @@ impl<S: Section> OAuth<S> {
         }
     }
 
-    /// One password attempt (D47). It runs as detached work: under one lock, the lockout is
+    /// One password attempt. It runs as detached work: under one lock, the lockout is
     /// checked first, then bcrypt runs on the blocking pool, then the failure is recorded or
     /// the code issued. So at most one check runs at a time, every completed wrong password
     /// counts even if its request was dropped, and parallel submissions cannot slip past

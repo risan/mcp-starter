@@ -10,10 +10,12 @@ use jiff::Timestamp;
 pub mod config;
 pub mod http;
 pub mod oauth;
+pub mod server;
 pub mod store;
 mod sys;
 #[cfg(feature = "test-support")]
 pub mod test_support;
+pub mod tools;
 pub mod work;
 
 /// What a service tells the blocks about itself. Everything service-specific the blocks need

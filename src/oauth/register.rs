@@ -125,7 +125,7 @@ async fn register_client<S: Section>(oauth: OAuth<S>, body: Bytes) -> Response {
     )
 }
 
-/// Removes the client unused for longest (Go D17): never-used clients first, oldest
+/// Removes the client unused for longest: never-used clients first, oldest
 /// registration first; otherwise the oldest grant. `keep` is spared. Returns whether a
 /// client was removed.
 fn evict_client<S>(state: &mut StoreState<S>, keep: &str) -> bool {

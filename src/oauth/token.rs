@@ -169,7 +169,7 @@ fn issue<S>(
 
 impl<S: Section> OAuth<S> {
     /// Exchanges an authorization code. It runs as detached work under one lock held from the
-    /// code lookup through the store commit that issues the tokens (D50), so a concurrent
+    /// code lookup through the store commit that issues the tokens, so a concurrent
     /// replay waits, then finds the family in `state.json` and revokes it.
     async fn exchange_code(self, grant: CodeGrant) -> Result<TokenResponse, OAuthError> {
         if grant.code.is_empty() || grant.client_id.is_empty() {

@@ -1,16 +1,19 @@
 //! A whole service on mcp-starter: its identity, its section of the state file and three
 //! tools. `main.rs` runs it; the tests of this crate include this file and drive it.
 
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
+use jiff::Timestamp;
+use mcp_starter::cli::{self, Getenv, Io, Outcome, Serving};
 use mcp_starter::config::Config;
-use mcp_starter::store::{Change, Section, Store};
+use mcp_starter::store::{Change, Lease, Section, Store, StoreOptions};
 use mcp_starter::tools::{
     ToolOutcome, call_tool, date_or_today, error_result, request_permit, run_tool,
 };
 use mcp_starter::work::{ConnPermit, Work};
-use mcp_starter::{Clock, ServiceInfo};
+use mcp_starter::{Clock, ServiceInfo, system_clock};
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolRequestParams, CallToolResponse, CallToolResult};
@@ -19,6 +22,7 @@ use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
 /// What the blocks need to know about this service.
 pub static SERVICE: ServiceInfo = ServiceInfo {
@@ -199,4 +203,105 @@ impl ServerHandler for ExampleTools {
 
         call_tool(&self.router, &tools, request, context).await
     }
+}
+
+const USAGE: &str = "usage: example-mcp [command]
+
+commands:
+  serve          run the MCP server (default)
+  set-password   set the owner password for the consent page
+  status         show the counter, password and token state (no secrets)
+  revoke-tokens  delete all OAuth tokens and registered clients
+";
+const TOOL_DEADLINE: Duration = Duration::from_secs(40);
+
+/// The command dispatch a service writes for itself: the blocks do the work, the service picks
+/// which blocks its commands call. `shutdown` ends `serve`; without it `serve` waits for
+/// SIGINT or SIGTERM.
+pub async fn run(
+    args: Vec<String>,
+    mut io: Io,
+    getenv: Getenv,
+    shutdown: Option<CancellationToken>,
+) -> Outcome {
+    let command = args.first().map_or("serve", String::as_str);
+
+    if matches!(command, "help" | "-h" | "--help") {
+        let _ = write!(io.stdout, "{USAGE}");
+
+        return Outcome::code(0);
+    }
+
+    if !matches!(
+        command,
+        "serve" | "set-password" | "status" | "revoke-tokens"
+    ) {
+        let _ = write!(io.stderr, "unknown command {command:?}\n{USAGE}");
+
+        return Outcome::code(2);
+    }
+
+    match dispatch(command, &mut io, getenv, shutdown).await {
+        Ok(lease) => Outcome { code: 0, lease },
+        Err(message) => {
+            let _ = writeln!(io.stderr, "{} {command}: {message}", SERVICE.command);
+
+            Outcome::code(1)
+        }
+    }
+}
+
+async fn dispatch(
+    command: &str,
+    io: &mut Io,
+    getenv: Getenv,
+    shutdown: Option<CancellationToken>,
+) -> Result<Option<Lease>, String> {
+    let config =
+        Config::load(&SERVICE, &*getenv, command == "serve").map_err(|error| error.to_string())?;
+    let store = Store::open(&config.data_dir, StoreOptions::default())
+        .map_err(|error| error.to_string())?;
+
+    match command {
+        "serve" => serve(io, config, store, shutdown).await.map(Some),
+        "set-password" => cli::set_password(io, &store).await.map(|()| None),
+        "status" => status(io, &store).await.map(|()| None),
+        _ => cli::revoke_tokens(io, &store).await.map(|()| None),
+    }
+}
+
+async fn serve(
+    io: &mut Io,
+    config: Config,
+    store: Store<ExampleState>,
+    shutdown: Option<CancellationToken>,
+) -> Result<Lease, String> {
+    let serving = Serving::start(&SERVICE, config, store, shutdown).await?;
+    let app = Arc::new(App {
+        store: serving.store.clone(),
+        config: serving.config.clone(),
+        work: serving.work.clone(),
+        now: system_clock(),
+        tool_deadline: TOOL_DEADLINE,
+    });
+
+    serving.run(io, ExampleTools::factory(app)).await
+}
+
+async fn status(io: &mut Io, store: &Store<ExampleState>) -> Result<(), String> {
+    let now = Timestamp::now();
+    let report = store
+        .read(move |state| {
+            format!(
+                "Count: {}\n{}",
+                state.section.count,
+                cli::oauth_status(state, now)
+            )
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let _ = write!(io.stdout, "{report}");
+
+    Ok(())
 }

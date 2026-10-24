@@ -4,17 +4,20 @@
 //! Enabled by the `test-support` feature, which a service turns on only under
 //! `[dev-dependencies]`.
 
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
 use jiff::{SignedDuration, Timestamp};
 use rmcp::ServerHandler;
+use sha2::Digest;
 use tokio::net::TcpListener;
 
 use crate::Clock;
 pub use crate::http::install_crypto_provider;
 use crate::server::mcp_service;
+use crate::store::{Change, Section, Store, Token, TokenKind};
 use jsonrpc::McpClient;
 
 pub mod jsonrpc;
@@ -126,4 +129,58 @@ where
     client.initialize().await;
 
     client
+}
+
+/// A `Write` that keeps what it is given, to read back what a command printed.
+#[derive(Clone, Default)]
+pub struct Capture(Arc<Mutex<Vec<u8>>>);
+
+impl Capture {
+    /// Everything written so far, as text.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl Write for Capture {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buffer);
+
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Stores a valid access token for a known bearer string, so a test can call the MCP endpoint
+/// without the OAuth flow.
+pub async fn store_bearer<S: Section>(store: &Store<S>, bearer: &str) {
+    let hash: String = sha2::Sha256::digest(bearer.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let expires_at = "2099-01-01T00:00:00Z".parse().unwrap();
+
+    store
+        .update(move |state| {
+            state.tokens.insert(
+                hash,
+                Token {
+                    kind: TokenKind::Access,
+                    client_id: "c".to_string(),
+                    family: "f".to_string(),
+                    scope: String::new(),
+                    resource: String::new(),
+                    expires_at,
+                    rotated: false,
+                    extra: Default::default(),
+                },
+            );
+
+            Change::Write(())
+        })
+        .await
+        .unwrap();
 }

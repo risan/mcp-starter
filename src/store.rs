@@ -270,6 +270,9 @@ struct Inner {
     lock_path: PathBuf,
     options: StoreOptions,
     temp_files_cleaned: AtomicBool,
+    /// The owner of a file the store opened. Tests replace it, because the uid that runs
+    /// them decides who owns the files they create.
+    file_owner: fn(&fs::Metadata) -> u32,
 }
 
 /// The state file of one data directory, typed by the service's section.
@@ -339,6 +342,7 @@ impl<S: Section> Store<S> {
                 lock_path: dir.join("state.lock"),
                 options,
                 temp_files_cleaned: AtomicBool::new(false),
+                file_owner: MetadataExt::uid,
             }),
             section: PhantomData,
         })
@@ -530,7 +534,7 @@ impl Inner {
             return Err(read_error(io::Error::other("has more than one link")));
         }
 
-        let file_uid = metadata.uid();
+        let file_uid = (self.file_owner)(&metadata);
         let (owner, _) = self.dir_owner()?;
 
         if file_uid != owner {
@@ -605,10 +609,10 @@ impl Inner {
         }
 
         let (uid, gid) = self.dir_owner()?;
-        let file_uid = file
+        let metadata = file
             .metadata()
-            .map_err(|error| StoreError::new(format!("inspect {}: {error}", path.display())))?
-            .uid();
+            .map_err(|error| StoreError::new(format!("inspect {}: {error}", path.display())))?;
+        let file_uid = (self.file_owner)(&metadata);
 
         if file_uid != uid && file_uid != euid {
             return Err(StoreError::new(format!(
@@ -1348,12 +1352,23 @@ mod tests {
         (path, content)
     }
 
+    /// A uid that is neither root nor [`other_uid`], whoever runs the tests.
+    const STRANGER_UID: u32 = 0xFFFF_FF00;
+
+    /// Makes the store see every file it opens as owned by `owner`, so a test does not depend
+    /// on the uid that runs it (root's own files are trusted).
+    fn report_file_owner(store: &mut Store<TestSection>, owner: fn(&fs::Metadata) -> u32) {
+        Arc::get_mut(&mut store.inner)
+            .expect("the store is not shared yet")
+            .file_owner = owner;
+    }
+
     fn assert_refused_as_foreign(error: &StoreError, name: &str) {
         let message = error.to_string();
 
         assert!(message.contains(name), "{message}");
         assert!(
-            message.contains(&format!("belongs to uid {}", sys::effective_uid())),
+            message.contains(&format!("belongs to uid {STRANGER_UID}")),
             "{message}"
         );
     }
@@ -1366,7 +1381,8 @@ mod tests {
         let mut options = StoreOptions::default();
         options.hooks.euid = Arc::new(move || other);
         options.hooks.dir_owner = Arc::new(move |_| Ok((other, other)));
-        let store = Store::<TestSection>::open(dir.path(), options).unwrap();
+        let mut store = Store::<TestSection>::open(dir.path(), options).unwrap();
+        report_file_owner(&mut store, |_| STRANGER_UID);
         let loaded = Arc::new(AtomicBool::new(false));
 
         let flag = loaded.clone();
@@ -1398,7 +1414,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (path, content) = plant_state_file(dir.path());
         let (options, chowned) = recording_root_options();
-        let store = Store::<TestSection>::open(dir.path(), options).unwrap();
+        let mut store = Store::<TestSection>::open(dir.path(), options).unwrap();
+        report_file_owner(&mut store, |_| STRANGER_UID);
 
         let error = store.read(|_| ()).await.err().unwrap();
 
@@ -1413,7 +1430,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("state.lock"), b"").unwrap();
         let (options, chowned) = recording_root_options();
-        let store = Store::<TestSection>::open(dir.path(), options).unwrap();
+        let mut store = Store::<TestSection>::open(dir.path(), options).unwrap();
+        report_file_owner(&mut store, |_| STRANGER_UID);
 
         let error = store.update(|_| Change::Unchanged(())).await.err().unwrap();
 
@@ -1426,7 +1444,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("session.lock"), b"").unwrap();
         let (options, chowned) = recording_root_options();
-        let store = Store::<TestSection>::open(dir.path(), options).unwrap();
+        let mut store = Store::<TestSection>::open(dir.path(), options).unwrap();
+        report_file_owner(&mut store, |_| STRANGER_UID);
 
         let error = Lease::acquire(&store, &INFO).err().unwrap();
 
@@ -1440,12 +1459,42 @@ mod tests {
         let cookies = dir.path().join("cookies.json");
         fs::write(&cookies, b"{}").unwrap();
         let (options, chowned) = recording_root_options();
-        let store = Store::<TestSection>::open(dir.path(), options).unwrap();
+        let mut store = Store::<TestSection>::open(dir.path(), options).unwrap();
+        report_file_owner(&mut store, |_| STRANGER_UID);
 
         let error = store.chown_to_dir_owner(&cookies).err().unwrap();
 
         assert_refused_as_foreign(&error, "cookies.json");
         assert!(chowned.lock().unwrap().is_empty(), "{chowned:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn root_hands_over_files_root_owns() {
+        let dir = tempfile::tempdir().unwrap();
+        let cookies = dir.path().join("cookies.json");
+        fs::write(&cookies, b"{}").unwrap();
+        let (options, chowned) = recording_root_options();
+        let mut store = Store::<TestSection>::open(dir.path(), options).unwrap();
+        report_file_owner(&mut store, |_| 0);
+
+        store.update(|_| Change::Unchanged(())).await.unwrap();
+        let _lease = Lease::acquire(&store, &INFO).unwrap();
+        store.chown_to_dir_owner(&cookies).unwrap();
+
+        let names: Vec<String> = chowned
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|path| {
+                Path::new(path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+
+        assert_eq!(names, ["state.lock", "session.lock", "cookies.json"]);
     }
 
     #[tokio::test(flavor = "current_thread")]

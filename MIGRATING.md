@@ -65,6 +65,10 @@ Everything else keeps mfp's text.
   `session.lock` and its temp files without following a symlink and refuses anything but a
   regular file with one link, so a root-run command cannot hand a planted link's target to the
   data dir's owner. `Store::chown_to_dir_owner(path)` applies the same rule.
+- Permissions are tightened, not only set at creation: `Store::open` changes an existing data
+  dir that grants any group or other access to 0700, and every load changes such a
+  `state.json` to 0600 before reading it (an imported 0644 file stops exposing its secrets).
+  `state.json` itself must be a regular file with one link; a symlink there is refused.
 - `Section::KEY` must not be `owner`, `clients` or `tokens`; `Store::open` panics if it is.
 - mcp-starter builds with tracing's `release_max_level_off`, which any binary that depends on it
   inherits.

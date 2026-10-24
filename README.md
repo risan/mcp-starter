@@ -25,6 +25,9 @@ TLS. That decides what it does and does not do:
   capped at 50 clients, with exact redirect URIs (Claude's callback and loopback URLs only).
 - Tokens are opaque and stored only as SHA-256 hashes. Refresh tokens rotate; replaying a used
   one revokes the whole family.
+- The data dir stays 0700 and `state.json` 0600: looser modes are tightened when the store
+  opens the dir and reads the file. Its files are never opened through a symlink, and a
+  root-run command changes their owner through the open descriptor only.
 - No multi-user model, no rate limiting beyond the lockout, no TLS (put it behind a proxy), no
   sessions: every MCP request is stateless.
 - Bounded everything: request bodies (1 MiB for `/mcp`, 64 KiB for OAuth), header size,

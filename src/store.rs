@@ -6,9 +6,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::marker::PhantomData;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -288,7 +288,8 @@ impl<S> Clone for Store<S> {
 }
 
 impl<S: Section> Store<S> {
-    /// Prepares the data directory (0700, created if missing). It does not read the state file.
+    /// Prepares the data directory: created 0700 if missing, tightened to 0700 if it grants
+    /// any group or other access. It does not read the state file.
     ///
     /// # Panics
     ///
@@ -319,6 +320,12 @@ impl<S: Section> Store<S> {
                 dir.display()
             )));
         }
+
+        File::open(dir)
+            .and_then(|opened| tighten(&opened, 0o700))
+            .map_err(|error| {
+                StoreError::new(format!("tighten data dir {}: {error}", dir.display()))
+            })?;
 
         Ok(Store {
             inner: Arc::new(Inner {
@@ -510,17 +517,23 @@ impl Inner {
         }
     }
 
+    /// Reads the state file, first tightening it to 0600 if it grants any group or other
+    /// access, so an imported 0644 file stops exposing its secrets.
     fn load<S: Section>(&self) -> Result<State<S>, StoreError> {
-        let data = match fs::read(&self.path) {
-            Ok(data) => data,
+        let read_error = |error| StoreError::new(format!("read {}: {error}", self.path.display()));
+        let mut file = match open_data_file(OpenOptions::new().read(true), &self.path) {
+            Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(State::default()),
-            Err(error) => {
-                return Err(StoreError::new(format!(
-                    "read {}: {error}",
-                    self.path.display()
-                )));
-            }
+            Err(error) => return Err(read_error(error)),
         };
+
+        tighten(&file, 0o600).map_err(|error| {
+            StoreError::new(format!("tighten {}: {error}", self.path.display()))
+        })?;
+
+        let mut data = Vec::new();
+
+        file.read_to_end(&mut data).map_err(read_error)?;
 
         serde_json::from_slice(&data)
             .map_err(|error| StoreError::new(format!("parse {}: {error}", self.path.display())))
@@ -608,6 +621,15 @@ fn open_data_file(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Sets `mode` on an open file or dir whose mode grants any group or other access.
+fn tighten(file: &File, mode: u32) -> io::Result<()> {
+    if file.metadata()?.permissions().mode() & 0o077 == 0 {
+        return Ok(());
+    }
+
+    file.set_permissions(fs::Permissions::from_mode(mode))
+}
+
 fn random_suffix() -> String {
     let mut bytes = [0u8; 6];
     getrandom::fill(&mut bytes).expect("the operating system has no randomness");
@@ -650,7 +672,6 @@ impl Lease {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
     use std::thread::ThreadId;
 
@@ -703,11 +724,70 @@ mod tests {
 
         bump_session_rev(&store).await;
 
-        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
-
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(mode(store.path()), 0o600);
         assert_eq!(mode(&dir.join("state.lock")), 0o600);
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn tightens_an_existing_data_dir() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("data");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
+
+        open(&dir);
+
+        assert_eq!(mode(&dir), 0o700);
+    }
+
+    #[test]
+    fn leaves_a_private_data_dir_alone() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("data");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+        open(&dir);
+
+        assert_eq!(mode(&dir), 0o500);
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tightens_a_readable_state_file_before_reading_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path());
+        bump_session_rev(&store).await;
+
+        fs::set_permissions(store.path(), fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(session_rev(&store).await, 1);
+        assert_eq!(mode(store.path()), 0o600);
+
+        fs::set_permissions(store.path(), fs::Permissions::from_mode(0o660)).unwrap();
+        store.update(|_| Change::Unchanged(())).await.unwrap();
+
+        assert_eq!(mode(store.path()), 0o600, "an update tightens it too");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refuses_a_symlinked_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_outside, target) = outside_target();
+        let store = open(dir.path());
+        std::os::unix::fs::symlink(&target, store.path()).unwrap();
+
+        let error = store.read(|_| ()).await.err().unwrap();
+
+        assert!(error.to_string().contains("state.json"), "{error}");
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        assert_untouched(&target);
     }
 
     #[tokio::test(flavor = "current_thread")]

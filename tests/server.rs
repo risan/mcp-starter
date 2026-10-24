@@ -158,6 +158,39 @@ async fn token_for_another_resource_401() {
 }
 
 #[tokio::test]
+async fn rig_with_its_own_public_url_runs_the_oauth_flow() {
+    let rig = support::start_with(Setup {
+        public_url: "https://garmin.example.org".to_string(),
+        ..Setup::default()
+    })
+    .await;
+
+    let client = rig.mcp().await;
+
+    assert!(!client.list_tools().await.is_empty());
+
+    let resources: Vec<String> = rig
+        .store
+        .read(|state| {
+            state
+                .tokens
+                .values()
+                .map(|token| token.resource.clone())
+                .collect()
+        })
+        .await
+        .unwrap();
+
+    assert!(!resources.is_empty());
+    assert!(
+        resources
+            .iter()
+            .all(|resource| resource == "https://garmin.example.org/mcp"),
+        "{resources:?}"
+    );
+}
+
+#[tokio::test]
 async fn expired_token_has_error_param() {
     let rig = support::start().await;
     let client = rig.mcp().await;

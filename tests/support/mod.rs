@@ -28,6 +28,7 @@ pub struct Setup {
     pub tool_deadline: Duration,
     pub server: ServerOptions,
     pub store: StoreOptions,
+    pub public_url: String,
 }
 
 impl Default for Setup {
@@ -36,6 +37,7 @@ impl Default for Setup {
             tool_deadline: Duration::from_secs(10),
             server: ServerOptions::default(),
             store: StoreOptions::default(),
+            public_url: RigSetup::default().public_url,
         }
     }
 }
@@ -49,7 +51,7 @@ pub async fn start_with(setup: Setup) -> ServerRig<ExampleState> {
     let rig_setup = RigSetup {
         server: setup.server,
         store: setup.store,
-        ..RigSetup::default()
+        public_url: setup.public_url,
     };
 
     ServerRig::start(

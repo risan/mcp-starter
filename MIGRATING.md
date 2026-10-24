@@ -77,6 +77,10 @@ Everything else keeps mfp's text.
 - `set-password` now also voids the authorization codes approved under the old password,
   including one from an attempt that was already being checked: the token endpoint refuses
   them with `invalid_grant`. Codes stay in memory, so the state file does not change.
+- `ServerRig` drives the OAuth flow with its `RigSetup.public_url` as the resource, so a rig
+  with its own public URL works with `ServerRig::mcp()`. For a hand-made client, use
+  `OAuthClient::new(info, base).with_issuer(public_url)` and its `authorize_params(client_id,
+  redirect)`; the free `authorize_params` still targets `ISSUER`.
 - `Section::KEY` must not be `owner`, `clients` or `tokens`; `Store::open` panics if it is.
 - mcp-starter builds with tracing's `release_max_level_off`, which any binary that depends on it
   inherits.

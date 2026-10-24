@@ -170,8 +170,23 @@ pub fn pkce(verifier: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
-/// The query of a valid authorization request.
+/// The query of a valid authorization request to a server at [`ISSUER`]. For a server at
+/// another public URL, use [`OAuthClient::authorize_params`] on a client made
+/// [`OAuthClient::with_issuer`].
 pub fn authorize_params(info: &ServiceInfo, client_id: &str, redirect: &str) -> Pairs {
+    params_for_resource(info, &resource_of(ISSUER), client_id, redirect)
+}
+
+fn resource_of(issuer: &str) -> String {
+    format!("{issuer}/mcp")
+}
+
+fn params_for_resource(
+    info: &ServiceInfo,
+    resource: &str,
+    client_id: &str,
+    redirect: &str,
+) -> Pairs {
     let scope = format!("{} offline_access", info.scope);
 
     [
@@ -182,7 +197,7 @@ pub fn authorize_params(info: &ServiceInfo, client_id: &str, redirect: &str) -> 
         ("code_challenge_method", "S256"),
         ("state", "st-1"),
         ("scope", &scope),
-        ("resource", &format!("{ISSUER}/mcp")),
+        ("resource", resource),
     ]
     .iter()
     .map(|(key, value)| (key.to_string(), value.to_string()))
@@ -200,12 +215,13 @@ pub fn set_param(pairs: &mut Pairs, name: &str, value: &str) {
 pub struct OAuthClient {
     http: reqwest::Client,
     info: &'static ServiceInfo,
+    resource: String,
     /// The base URL the routes are served at.
     pub base: String,
 }
 
 impl OAuthClient {
-    /// A client for the routes served at `base`.
+    /// A client for the routes served at `base` by a server whose public URL is [`ISSUER`].
     pub fn new(info: &'static ServiceInfo, base: &str) -> OAuthClient {
         super::install_crypto_provider();
 
@@ -215,8 +231,22 @@ impl OAuthClient {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap(),
+            resource: resource_of(ISSUER),
             base: base.to_string(),
         }
+    }
+
+    /// The same client for a server whose public URL is `issuer`: its authorization
+    /// requests name `issuer/mcp` as the resource.
+    pub fn with_issuer(mut self, issuer: &str) -> OAuthClient {
+        self.resource = resource_of(issuer);
+
+        self
+    }
+
+    /// The query of a valid authorization request to this client's server.
+    pub fn authorize_params(&self, client_id: &str, redirect: &str) -> Pairs {
+        params_for_resource(self.info, &self.resource, client_id, redirect)
     }
 
     async fn reply(response: reqwest::Response) -> Reply {
@@ -308,7 +338,7 @@ impl OAuthClient {
     /// Runs the whole consent flow and returns the authorization code.
     pub async fn grant(&self, client_id: &str, redirect: &str) -> String {
         let (form, reply) = self
-            .consent(&authorize_params(self.info, client_id, redirect))
+            .consent(&self.authorize_params(client_id, redirect))
             .await;
         let form =
             form.unwrap_or_else(|| panic!("no consent page ({}): {}", reply.status, reply.body));
@@ -372,7 +402,7 @@ impl OAuthClient {
     pub async fn full_flow_with_password(&self, password: &str) -> (String, Tokens, String) {
         let client_id = self.register(&[CLAUDE_CALLBACK]).await;
         let (form, reply) = self
-            .consent(&authorize_params(self.info, &client_id, CLAUDE_CALLBACK))
+            .consent(&self.authorize_params(&client_id, CLAUDE_CALLBACK))
             .await;
         let form =
             form.unwrap_or_else(|| panic!("no consent page ({}): {}", reply.status, reply.body));

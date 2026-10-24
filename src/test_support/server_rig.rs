@@ -153,7 +153,8 @@ impl<S: Section> ServerRig<S> {
             work,
             clock,
             probe,
-            oauth_client: OAuthClient::new(info, &format!("http://{address}")),
+            oauth_client: OAuthClient::new(info, &format!("http://{address}"))
+                .with_issuer(&setup.public_url),
             address,
             shutdown,
             stopped: Some(stopped),

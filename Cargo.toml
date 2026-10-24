@@ -1,0 +1,48 @@
+[package]
+name = "mcp-starter"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Building blocks for a single-owner MCP server: OAuth, state file, HTTP server, tool helpers"
+license = "MIT"
+repository = "https://github.com/risan/mcp-starter"
+publish = false
+
+[lib]
+name = "mcp_starter"
+path = "src/lib.rs"
+
+[features]
+# Rigs, clocks and a test TLS chain for the tests of a service built on this crate.
+test-support = ["dep:tempfile", "dep:tokio-rustls", "axum/tokio"]
+
+[dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "form", "query"] }
+base64 = "0.23.1"
+bcrypt = { version = "0.19.3", default-features = false, features = ["std"] }
+getrandom = "0.4.3"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio", "service"] }
+jiff = { version = "0.2.38", default-features = false, features = ["std", "serde", "tzdb-bundle-always"] }
+libc = "0.2.191"
+rpassword = "7.5.4"
+rmcp = { version = "3.7.0", default-features = false, features = ["server", "macros", "schemars", "transport-streamable-http-server"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "query"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+schemars = "1.2.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+serde_urlencoded = "0.7.1"
+sha2 = "0.11.1"
+tokio = { version = "1.54.1", features = ["rt", "net", "time", "signal", "sync", "macros"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
+# Only here to turn on release_max_level_off, which compiles rmcp's tracing calls out of any binary
+# that depends on this crate.
+tracing = { version = "0.1.44", features = ["release_max_level_off"] }
+tempfile = { version = "3.27.0", optional = true }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"], optional = true }
+
+[dev-dependencies]
+http-body = "1.1.0"
+mcp-starter = { path = ".", features = ["test-support"] }

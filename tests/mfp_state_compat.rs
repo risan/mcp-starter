@@ -6,9 +6,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use jiff::Timestamp;
+use mcp_starter::ServiceInfo;
+use mcp_starter::oauth::{OAuth, bcrypt_checker};
 use mcp_starter::store::{Change, Section, Store, StoreOptions, TokenKind};
+use mcp_starter::test_support::TestClock;
+use mcp_starter::test_support::oauth_flow::{ISSUER, OAuthClient};
+use mcp_starter::work::Work;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use tokio_util::task::TaskTracker;
 
 /// Copied field by field, with its serde attributes, from mfp-mcp-rs `src/store.rs`.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -208,4 +214,65 @@ fn unknown_extras_survive_a_save() {
     assert_eq!(saved["added_top"]["a"], 1);
     assert_eq!(saved["owner"]["x"], 1);
     assert_eq!(saved["mfp"]["session_rev"], 3);
+}
+
+static MFP_INFO: ServiceInfo = ServiceInfo {
+    command: "mfp-mcp",
+    display_name: "MyFitnessPal",
+    env_prefix: "MFP_MCP_",
+    default_listen: "127.0.0.1:8080",
+    default_data_dir: "/var/lib/mfp-mcp",
+    default_tz: "Asia/Jakarta",
+    scope: "mfp",
+    favicon: &[],
+};
+
+#[tokio::test]
+async fn go_fixture_token_verifies() {
+    let (_dir, store) = open_with_fixture("go-state-full.json");
+    let clock = TestClock::new("2026-10-24T09:00:00Z");
+    let work = Work::new(TaskTracker::new());
+    let oauth = OAuth::new(
+        &MFP_INFO,
+        store.clone(),
+        ISSUER,
+        clock.as_clock(),
+        bcrypt_checker(),
+        work,
+    );
+
+    let info = oauth.verify("fixture-access-token-full").await.unwrap();
+
+    assert_eq!(info.scope, "mfp");
+    assert!(
+        oauth.verify("fixture-refresh-token-full").await.is_err(),
+        "a refresh token is not an access token"
+    );
+    assert!(oauth.verify("fixture-refresh-token-old").await.is_err());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let routes = oauth.routes();
+    tokio::spawn(async move {
+        axum::serve(listener, routes).await.unwrap();
+    });
+    let client = OAuthClient::new(&MFP_INFO, &format!("http://{address}"));
+
+    let (reply, rotated) = client
+        .refresh("client-full", "fixture-refresh-token-full")
+        .await;
+    let rotated = rotated.unwrap();
+
+    assert_eq!(reply.status, 200);
+    assert!(oauth.verify(&rotated.access_token).await.is_ok());
+
+    let (reply, _) = client
+        .refresh("client-full", "fixture-refresh-token-full")
+        .await;
+
+    assert_eq!(
+        reply.error_code(),
+        "invalid_grant",
+        "the old fixture refresh token was rotated"
+    );
 }

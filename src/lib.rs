@@ -8,6 +8,7 @@ use std::sync::Arc;
 use jiff::Timestamp;
 
 pub mod config;
+pub mod store;
 mod sys;
 
 /// What a service tells the blocks about itself. Everything service-specific the blocks need

@@ -2,8 +2,6 @@
 
 #![allow(unsafe_code)]
 
-// Dropped when the store starts using it.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn effective_uid() -> u32 {
     // SAFETY: geteuid takes no arguments, touches no memory and cannot fail.
     unsafe { libc::geteuid() }

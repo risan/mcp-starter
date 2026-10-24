@@ -102,6 +102,9 @@ struct CodeRecord {
     challenge: String,
     scope: String,
     resource: String,
+    /// The owner password hash the approval was checked against. A password change makes
+    /// the code worthless, including one approved by an attempt that was already queued.
+    owner_hash: String,
     expires: Timestamp,
     seq: u64,
 }

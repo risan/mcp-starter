@@ -170,7 +170,8 @@ fn issue<S>(
 impl<S: Section> OAuth<S> {
     /// Exchanges an authorization code. It runs as detached work under one lock held from the
     /// code lookup through the store commit that issues the tokens, so a concurrent
-    /// replay waits, then finds the family in `state.json` and revokes it.
+    /// replay waits, then finds the family in `state.json` and revokes it. The commit also
+    /// refuses the code when the owner password changed since it was approved.
     async fn exchange_code(self, grant: CodeGrant) -> Result<TokenResponse, OAuthError> {
         if grant.code.is_empty() || grant.client_id.is_empty() {
             return Err(OAuthError::bad_request(
@@ -214,6 +215,10 @@ impl<S: Section> OAuth<S> {
             .inner
             .store
             .update(move |state| {
+                if state.owner.password_hash != record.owner_hash {
+                    return Change::Unchanged(Err(OAuthError::invalid_grant()));
+                }
+
                 let Some(client) = state.clients.get_mut(&client_id) else {
                     return Change::Unchanged(Err(OAuthError::invalid_grant()));
                 };

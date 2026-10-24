@@ -74,6 +74,9 @@ Everything else keeps mfp's text.
   another public URL, or a change of `MFP_MCP_PUBLIC_URL`, signs the clients out and they
   reconnect. A record without a `resource` (written by the Go server) is still accepted, and
   refreshing it gives the new tokens this server's resource.
+- `set-password` now also voids the authorization codes approved under the old password,
+  including one from an attempt that was already being checked: the token endpoint refuses
+  them with `invalid_grant`. Codes stay in memory, so the state file does not change.
 - `Section::KEY` must not be `owner`, `clients` or `tokens`; `Store::open` panics if it is.
 - mcp-starter builds with tracing's `release_max_level_off`, which any binary that depends on it
   inherits.

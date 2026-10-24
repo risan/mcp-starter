@@ -1203,6 +1203,70 @@ async fn set_password_and_revoke_all() {
     assert!(state.tokens.is_empty() && state.clients.is_empty());
 }
 
+#[tokio::test]
+async fn code_approved_before_a_password_change_refused() {
+    let rig = support::rig().await;
+    let client_id = rig.client.register(&[CLAUDE_CALLBACK]).await;
+    let code = rig.client.grant(&client_id, CLAUDE_CALLBACK).await;
+
+    set_password(&rig.store, "a brand new long password")
+        .await
+        .unwrap();
+
+    let (reply, tokens) = rig
+        .client
+        .exchange(&client_id, CLAUDE_CALLBACK, &code, VERIFIER)
+        .await;
+
+    assert_eq!(
+        (reply.status, reply.error_code().as_str()),
+        (400, "invalid_grant"),
+        "{}",
+        reply.body
+    );
+    assert!(tokens.is_none());
+    assert!(rig.state().await.tokens.is_empty());
+}
+
+#[tokio::test]
+async fn attempt_queued_across_a_password_change_yields_a_dead_code() {
+    let rig = support::rig().await;
+    let client_id = rig.client.register(&[CLAUDE_CALLBACK]).await;
+    let (form, _) = rig
+        .client
+        .consent(&authorize_params(&INFO, &client_id, CLAUDE_CALLBACK))
+        .await;
+    let form = form.unwrap();
+
+    rig.probe.hold();
+
+    let client = rig.client.clone();
+    let approving = tokio::spawn(async move { client.approve(&form, OWNER_PASSWORD).await });
+
+    wait_until(
+        Duration::from_secs(5),
+        "the password check to start",
+        || rig.probe.started() >= 1,
+    )
+    .await;
+    set_password(&rig.store, "a brand new long password")
+        .await
+        .unwrap();
+    rig.probe.release();
+
+    let approved = approving.await.unwrap();
+    let code = approved
+        .location_param("code")
+        .unwrap_or_else(|| panic!("no code ({}): {}", approved.status, approved.body));
+    let (reply, _) = rig
+        .client
+        .exchange(&client_id, CLAUDE_CALLBACK, &code, VERIFIER)
+        .await;
+
+    assert_eq!(reply.error_code(), "invalid_grant", "{}", reply.body);
+    assert!(rig.state().await.tokens.is_empty());
+}
+
 async fn submit_wrong_passwords(
     rig: &OAuthRig<TestState>,
     client_id: &str,

@@ -293,7 +293,8 @@ impl<S: Section> OAuth<S> {
         }
 
         let checker = self.inner.checker.clone();
-        let matches = tokio::task::spawn_blocking(move || checker(&hash, &password))
+        let checked_hash = hash.clone();
+        let matches = tokio::task::spawn_blocking(move || checker(&checked_hash, &password))
             .await
             .unwrap_or(false);
 
@@ -322,6 +323,7 @@ impl<S: Section> OAuth<S> {
             challenge: request.code_challenge,
             scope,
             resource,
+            owner_hash: hash,
             expires: now + CODE_TTL,
             seq: pending.seq,
         };

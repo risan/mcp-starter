@@ -1,4 +1,43 @@
-//! Building blocks for a single-owner MCP server.
+//! Building blocks for a single-owner MCP server: an OAuth 2.1 authorization server, a JSON
+//! state file with a cross-process lock, an HTTP server with strict deadlines, the CLI
+//! commands every such server needs and the helpers that run MCP tools as detached work.
+//!
+//! This is not a framework. A service keeps its own `main`, command dispatch, tool handler
+//! and upstream client, and gives the blocks three things: a [`ServiceInfo`], its own
+//! [`store::Section`] type and a factory for its tool handler. A complete service is in
+//! `examples/minimal`; `cargo test` compiles and runs it.
+//!
+//! ```ignore
+//! pub static SERVICE: ServiceInfo = ServiceInfo { /* command, prefix, defaults, scope */ };
+//!
+//! #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+//! pub struct MyState { /* the service's part of state.json */ }
+//!
+//! impl Section for MyState {
+//!     const KEY: &'static str = "my_service";
+//! }
+//!
+//! fn main() {
+//!     runtime::run_main(|args, io, getenv| my_service::run(args, io, getenv))
+//! }
+//!
+//! // in `serve`:
+//! let serving = cli::Serving::start(&SERVICE, config, store, None).await?;
+//! serving.run(&mut io, MyTools::factory(app)).await
+//! ```
+//!
+//! | Module | What it holds |
+//! |---|---|
+//! | [`config`] | the environment settings under the service's prefix |
+//! | [`store`] | the state file, [`store::Section`], the lease |
+//! | [`oauth`] | the authorization server and the owner-password commands' core |
+//! | [`server`] | the router, bearer check, body caps and the connection driver |
+//! | [`work`] | detached, tracked work and the connection slot |
+//! | [`http`] | the upstream client builder and bounded reads |
+//! | [`tools`] | tool-call helpers for an rmcp handler |
+//! | [`cli`] | the shared commands and the `serve` runner |
+//! | [`runtime`] | the current-thread runtime and exit sequence |
+//! | `test_support` | rigs and helpers for tests (feature `test-support`) |
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]

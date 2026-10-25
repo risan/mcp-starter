@@ -3,7 +3,7 @@
 //! The file holds the service's own section under [`Section::KEY`], then `owner`, `clients`
 //! and `tokens`, then any key this crate does not know. Unknown keys survive every save.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
-use serde::de::{DeserializeOwned, MapAccess, Visitor};
+use serde::de::{DeserializeOwned, Error as _, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
@@ -80,8 +80,15 @@ impl<'de, S: Section> Deserialize<'de> for State<S> {
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<State<S>, A::Error> {
                 let mut state = State::default();
+                let mut seen = BTreeSet::new();
 
                 while let Some(key) = map.next_key::<String>()? {
+                    // A later duplicate would silently replace the earlier value, and the next
+                    // save would then drop it.
+                    if !seen.insert(key.clone()) {
+                        return Err(A::Error::custom(format!("duplicate field `{key}`")));
+                    }
+
                     match key.as_str() {
                         "owner" => state.owner = map.next_value()?,
                         "clients" => state.clients = map.next_value()?,
@@ -771,6 +778,24 @@ mod tests {
         scope: "example",
         favicon: &[],
     };
+
+    #[test]
+    fn duplicate_top_level_fields_are_refused() {
+        for json in [
+            r#"{"test":{"rev":12},"test":{}}"#,
+            r#"{"owner":{"password_hash":"$2b$12$x"},"owner":{}}"#,
+            r#"{"clients":{},"clients":{}}"#,
+            r#"{"tokens":{},"tokens":{}}"#,
+            r#"{"later":1,"later":2}"#,
+        ] {
+            let error = serde_json::from_str::<State<TestSection>>(json).unwrap_err();
+
+            assert!(
+                error.to_string().contains("duplicate field"),
+                "{json}: {error}"
+            );
+        }
+    }
 
     fn open(dir: &Path) -> Store<TestSection> {
         Store::open(dir, StoreOptions::default()).unwrap()

@@ -291,6 +291,7 @@ async fn metadata<S: Section>(State(oauth): State<OAuth<S>>) -> Response {
             "code_challenge_methods_supported": ["S256"],
             "token_endpoint_auth_methods_supported": ["none"],
             "scopes_supported": [oauth.inner.info.scope, OFFLINE_ACCESS],
+            "authorization_response_iss_parameter_supported": true,
         }),
     )
 }

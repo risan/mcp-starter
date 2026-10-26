@@ -362,14 +362,20 @@ impl<S: Section> OAuth<S> {
         let mut html = page_head(self.inner.info.display_name);
 
         html.push_str(&format!(
-            "<p><strong>{}</strong> wants access to your {} data.</p>\n<p>It will be sent back to <strong>{}</strong>.</p>\n",
+            "<p><strong>{}</strong> (the name the application gave itself) wants access to your {} data.</p>\n<p>It will be sent back to <strong>{}</strong>.</p>\n<p>Callback: <code>{}</code><br>Client ID: <code>{}</code></p>\n",
             escape_html(name),
             escape_html(self.inner.info.display_name),
-            escape_html(&redirect_host)
+            escape_html(&redirect_host),
+            escape_html(&request.redirect_uri),
+            escape_html(&client.client_id)
         ));
 
+        // Registration is open, so anyone with a Claude or ChatGPT account can register a client
+        // and send the owner a link to this page.
         if parse_loopback(&request.redirect_uri).is_some() {
             html.push_str("<p class=\"warn\">This is a loopback address (a program on the same machine as your browser). Continue only if you started this connection yourself.</p>\n");
+        } else {
+            html.push_str("<p class=\"warn\">Approve only a connection you started yourself just now. Anyone can register an application here and send you a link to this page.</p>\n");
         }
 
         if !message.is_empty() {

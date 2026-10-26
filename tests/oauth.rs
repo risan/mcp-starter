@@ -38,6 +38,7 @@ async fn metadata() {
     assert_eq!(meta["token_endpoint"], format!("{ISSUER}/token"));
     assert_eq!(meta["registration_endpoint"], format!("{ISSUER}/register"));
     assert_eq!(meta["revocation_endpoint"], format!("{ISSUER}/revoke"));
+    assert_eq!(meta["authorization_response_iss_parameter_supported"], true);
     assert_eq!(meta["response_types_supported"], json!(["code"]));
     assert_eq!(
         meta["grant_types_supported"],
@@ -301,6 +302,12 @@ async fn authorize_consent_page() {
     assert!(form.is_some());
     assert_eq!(reply.status, 200);
     assert!(reply.body.contains("Claude") && reply.body.contains("claude.ai"));
+    assert!(reply.body.contains(CLAUDE_CALLBACK) && reply.body.contains(&client_id));
+    assert!(
+        reply
+            .body
+            .contains("Approve only a connection you started yourself")
+    );
     assert!(!reply.body.contains("loopback"));
 
     let csp = reply.header("content-security-policy");
@@ -333,12 +340,53 @@ async fn authorize_consent_page() {
         reply.body
     );
     assert!(
+        !reply
+            .body
+            .contains("Approve only a connection you started yourself")
+    );
+    assert!(
         reply
             .header("content-security-policy")
             .contains("form-action 'self' http://127.0.0.1:5555"),
         "{}",
         reply.header("content-security-policy")
     );
+}
+
+#[tokio::test]
+async fn chatgpt_callbacks_complete_the_flow() {
+    let rig = support::rig().await;
+
+    for callback in [
+        "https://chatgpt.com/connector_platform_oauth_redirect",
+        "https://chatgpt.com/connector/oauth/AbC-12_xyz",
+    ] {
+        let client_id = rig.client.register(&[callback]).await;
+        let (form, reply) = rig
+            .client
+            .consent(&authorize_params(&INFO, &client_id, callback))
+            .await;
+
+        assert!(reply.body.contains(callback), "{callback}: {}", reply.body);
+
+        let approved = rig.client.approve(&form.unwrap(), OWNER_PASSWORD).await;
+
+        assert_eq!(approved.status, 303, "{callback}: {}", approved.body);
+        assert!(
+            approved.header("location").starts_with(callback),
+            "{callback}"
+        );
+        assert_eq!(approved.location_param("iss").as_deref(), Some(ISSUER));
+
+        let code = approved.location_param("code").unwrap();
+        let (reply, issued) = rig
+            .client
+            .exchange(&client_id, callback, &code, VERIFIER)
+            .await;
+
+        assert_eq!(reply.status, 200, "{callback}: {}", reply.body);
+        assert!(issued.is_some(), "{callback}");
+    }
 }
 
 #[tokio::test]

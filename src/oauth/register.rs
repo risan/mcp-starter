@@ -11,6 +11,11 @@ use crate::store::{Change, Client, Section, State as StoreState};
 use crate::work::ConnPermit;
 
 pub(super) const CLAUDE_CALLBACK: &str = "https://claude.ai/api/mcp/auth_callback";
+// ChatGPT uses the stable callback or, for an authorization server without RFC 9207 issuer
+// identification, one with a per-connector id
+// (https://developers.openai.com/apps-sdk/build/auth).
+const CHATGPT_CALLBACK: &str = "https://chatgpt.com/connector_platform_oauth_redirect";
+const CHATGPT_CONNECTOR_CALLBACK_PREFIX: &str = "https://chatgpt.com/connector/oauth/";
 
 #[derive(Deserialize)]
 struct Registration {
@@ -172,7 +177,21 @@ pub(super) fn parse_loopback(raw: &str) -> Option<Url> {
 }
 
 fn allowed_redirect(raw: &str) -> bool {
-    raw == CLAUDE_CALLBACK || parse_loopback(raw).is_some()
+    raw == CLAUDE_CALLBACK
+        || raw == CHATGPT_CALLBACK
+        || is_chatgpt_connector_callback(raw)
+        || parse_loopback(raw).is_some()
+}
+
+fn is_chatgpt_connector_callback(raw: &str) -> bool {
+    let Some(callback_id) = raw.strip_prefix(CHATGPT_CONNECTOR_CALLBACK_PREFIX) else {
+        return false;
+    };
+
+    (1..=128).contains(&callback_id.len())
+        && callback_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
 /// Accepts the exact registered URI, or for loopback URIs the same host, path and query on

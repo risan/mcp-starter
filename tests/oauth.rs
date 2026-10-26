@@ -64,6 +64,8 @@ async fn register() {
 
     for redirect in [
         CLAUDE_CALLBACK,
+        "https://chatgpt.com/connector_platform_oauth_redirect",
+        "https://chatgpt.com/connector/oauth/AbC-12_xyz",
         "http://127.0.0.1:5555/callback",
         "http://localhost:6000/callback",
     ] {
@@ -93,6 +95,15 @@ async fn register() {
         "http://127.0.0.1.evil.example:80/cb",
         "http://localhost@evil.example/cb",
         "javascript:alert(1)",
+        "http://chatgpt.com/connector_platform_oauth_redirect",
+        "https://chatgpt.com/connector_platform_oauth_redirect/extra",
+        "https://chatgpt.com/connector/oauth/",
+        "https://chatgpt.com/connector/oauth/abc/def",
+        "https://chatgpt.com/connector/oauth/abc?next=https://evil.example",
+        "https://chatgpt.com/connector/oauth/abc#fragment",
+        "https://chatgpt.com/connector/oauth/%2e%2e",
+        "https://chatgpt.com.evil.example/connector/oauth/abc",
+        "https://chatgpt.com:8443/connector/oauth/abc",
     ] {
         let reply = rig
             .client

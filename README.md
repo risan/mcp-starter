@@ -23,7 +23,7 @@ TLS. That decides what it does and does not do:
 - One owner password, hashed with bcrypt, checked on the OAuth consent page. Five wrong
   attempts lock the page for 15 minutes. Changing the password revokes every token and voids
   every authorization code approved under the old one. Dynamic client registration is open (Claude needs it),
-  capped at 50 clients, with exact redirect URIs (Claude's callback and loopback URLs only).
+  capped at 50 clients, with exact redirect URIs (Claude's and ChatGPT's callbacks and loopback URLs only).
 - Tokens are opaque and stored only as SHA-256 hashes. Refresh tokens rotate; replaying a used
   one revokes the whole family. A token works only for the resource (`{public URL}/mcp`) it
   was issued for.

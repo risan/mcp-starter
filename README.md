@@ -88,15 +88,15 @@ Tools run through `tools::run_tool`, which spawns the body as tracked detached w
 for it until a deadline, and answers with a plain tool error when the deadline passes. A
 request the client drops does not cancel the body, and shutdown waits for it.
 
-Dependencies: add the crate from git, and the test helpers (rigs, a fake clock, a throwaway TLS
-chain) only under `[dev-dependencies]`:
+Dependencies: add the crate, and the test helpers (rigs, a fake clock, a throwaway TLS chain)
+only under `[dev-dependencies]`:
 
 ```toml
 [dependencies]
-mcp-starter = { git = "https://github.com/risan/mcp-starter", tag = "v0.1.0" }
+mcp-starter = "0.1.3"
 
 [dev-dependencies]
-mcp-starter = { git = "https://github.com/risan/mcp-starter", tag = "v0.1.0", features = ["test-support"] }
+mcp-starter = { version = "0.1.3", features = ["test-support"] }
 ```
 
 Moving an existing mfp-mcp-rs onto it: see [MIGRATING.md](MIGRATING.md).

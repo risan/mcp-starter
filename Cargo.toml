@@ -7,11 +7,13 @@ description = "Building blocks for a single-owner MCP server: OAuth, state file,
 license = "MIT"
 repository = "https://github.com/risan/mcp-starter"
 readme = "README.md"
-keywords = ["mcp", "model-context-protocol", "oauth", "server", "self-hosted"]
+keywords = ["mcp", "mcp-server", "oauth", "self-hosted", "streamable-http"]
 categories = ["web-programming::http-server", "authentication"]
 
 [package.metadata.docs.rs]
 all-features = true
+# The store and process code use Unix APIs.
+targets = ["x86_64-unknown-linux-gnu"]
 
 [lib]
 name = "mcp_starter"

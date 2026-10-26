@@ -6,7 +6,12 @@ rust-version = "1.99"
 description = "Building blocks for a single-owner MCP server: OAuth, state file, HTTP server, tool helpers"
 license = "MIT"
 repository = "https://github.com/risan/mcp-starter"
-publish = false
+readme = "README.md"
+keywords = ["mcp", "model-context-protocol", "oauth", "server", "self-hosted"]
+categories = ["web-programming::http-server", "authentication"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [lib]
 name = "mcp_starter"

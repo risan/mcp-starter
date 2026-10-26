@@ -2,7 +2,7 @@
 //! rigs that run the OAuth server and the whole HTTP server in the test process.
 //!
 //! Enabled by the `test-support` feature, which a service turns on only under
-//! `[dev-dependencies]`.
+//! `[dev-dependencies]`. It carries no stability promise: any release may change it.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};

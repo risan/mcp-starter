@@ -138,6 +138,7 @@ mod tests {
         default_tz: "Asia/Jakarta",
         scope: "example",
         favicon: &[],
+        home_page: "",
     };
 
     fn config() -> Config {

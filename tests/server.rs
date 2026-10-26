@@ -772,6 +772,24 @@ async fn favicon_served_without_a_token() {
 }
 
 #[tokio::test]
+async fn home_page_served_without_a_token() {
+    let rig = support::start().await;
+
+    let (status, reply) = raw_http(&rig.address, "GET", "/", &[], "", false).await;
+
+    assert_eq!(status, 200);
+    assert!(
+        reply.contains("content-type: text/html; charset=utf-8"),
+        "{reply}"
+    );
+    assert!(
+        reply.contains("<link rel=\"icon\" href=\"/favicon.ico\">"),
+        "{reply}"
+    );
+    assert_eq!(rig.work.peak_tasks(), 0, "the home page starts no work");
+}
+
+#[tokio::test]
 async fn end_to_end_tools_list() {
     let rig = support::start().await;
     let client = rig.mcp().await;

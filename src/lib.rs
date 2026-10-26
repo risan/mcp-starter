@@ -79,6 +79,10 @@ pub struct ServiceInfo {
     pub scope: &'static str,
     /// The bytes served at `/favicon.ico`.
     pub favicon: &'static [u8],
+    /// The HTML page served at `/`; empty leaves `/` a 404. claude.ai takes a connector's icon
+    /// from Google's favicon index, which only knows a host that has a page to crawl, so a page
+    /// that links the favicon is what gets the service its own icon there.
+    pub home_page: &'static str,
 }
 
 /// A source of the current time, replaceable in tests.

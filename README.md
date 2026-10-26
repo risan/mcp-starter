@@ -11,7 +11,7 @@ runtime, the CLI commands every such server needs (`set-password`, `revoke-token
 It is not a framework. Your service keeps its own `main`, its command dispatch (about 50
 lines), its tool handler and its client for whatever it talks to. The only things you give the
 blocks are a `ServiceInfo` (command name, display name, environment prefix, defaults, scope,
-favicon), your section type for the state file, and a factory for your tool handler.
+favicon, home page), your section type for the state file, and a factory for your tool handler.
 
 The code is the generic part of [mfp-mcp-rs](#credits), moved and generalized, not rewritten.
 
@@ -70,7 +70,7 @@ A complete service is in [`examples/minimal`](examples/minimal): `service.rs` ho
 lines. `cargo test` compiles and runs it, and this crate's own tests drive it. In outline:
 
 ```rust,ignore
-pub static SERVICE: ServiceInfo = ServiceInfo { /* command, prefix, defaults, scope, favicon */ };
+pub static SERVICE: ServiceInfo = ServiceInfo { /* command, prefix, defaults, scope, favicon, home page */ };
 
 #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MyState { /* your part of state.json */ }

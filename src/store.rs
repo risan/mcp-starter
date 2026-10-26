@@ -777,6 +777,7 @@ mod tests {
         default_tz: "Asia/Jakarta",
         scope: "example",
         favicon: &[],
+        home_page: "",
     };
 
     #[test]

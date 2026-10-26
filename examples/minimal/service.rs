@@ -34,6 +34,8 @@ pub static SERVICE: ServiceInfo = ServiceInfo {
     default_tz: "Asia/Jakarta",
     scope: "example",
     favicon: include_bytes!("favicon.ico"),
+    home_page: "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>example-mcp</title>\
+                <link rel=\"icon\" href=\"/favicon.ico\"></head><body><h1>example-mcp</h1></body></html>",
 };
 
 /// The service's part of the state file, stored under the key `example`.

@@ -225,6 +225,7 @@ static MFP_INFO: ServiceInfo = ServiceInfo {
     default_tz: "Asia/Jakarta",
     scope: "mfp",
     favicon: &[],
+    home_page: "",
 };
 
 /// The public URL the fixture's tokens were issued under (resource `{FIXTURE_ISSUER}/mcp`).

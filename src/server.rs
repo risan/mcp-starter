@@ -81,9 +81,9 @@ where
     )
 }
 
-/// Every route behind its body layer: `/healthz`, the favicon, the OAuth routes, the
-/// protected-resource metadata and `/mcp`. `/mcp` checks the bearer first, so an anonymous
-/// caller never makes the server buffer a body.
+/// Every route behind its body layer: `/healthz`, the favicon, the home page (when set), the OAuth
+/// routes, the protected-resource metadata and `/mcp`. `/mcp` checks the bearer first, so an
+/// anonymous caller never makes the server buffer a body.
 pub fn build_router<S, H>(
     info: &'static ServiceInfo,
     oauth: OAuth<S>,
@@ -117,6 +117,15 @@ where
             info.favicon,
         )
     };
+    let home_page = move || async move {
+        (
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "public, max-age=3600"),
+            ],
+            info.home_page,
+        )
+    };
 
     let oauth_routes = oauth.routes();
     let mcp = Router::new()
@@ -131,10 +140,15 @@ where
             require_bearer,
         ));
 
-    Router::new()
+    let mut router = Router::new()
         .route("/healthz", get(|| async { "ok\n" }))
-        // The connector icon in claude.ai: without it Claude shows the icon of the parent domain.
-        .route("/favicon.ico", get(favicon))
+        .route("/favicon.ico", get(favicon));
+
+    if !info.home_page.is_empty() {
+        router = router.route("/", get(home_page));
+    }
+
+    router
         .route(
             "/.well-known/oauth-protected-resource",
             get(metadata.clone()),

@@ -120,6 +120,7 @@ mod tests {
         default_tz: "Asia/Jakarta",
         scope: "example",
         favicon: &[],
+        home_page: "",
     };
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> String {

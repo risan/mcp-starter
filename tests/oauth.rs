@@ -1749,6 +1749,7 @@ async fn service_names_are_html_escaped() {
         default_tz: "UTC",
         scope: "other",
         favicon: &[],
+        home_page: "",
     };
 
     let rig = OAuthRig::<TestState>::start(&OTHER).await;

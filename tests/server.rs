@@ -7,18 +7,24 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use mcp_starter::server::ServerOptions;
+use axum::Router;
+use axum::middleware;
+use axum::routing::post;
+use mcp_starter::server::{ServerOptions, buffer_body, serve};
 use mcp_starter::store::{Hooks, StoreOptions};
 use mcp_starter::test_support::jsonrpc::McpClient;
 use mcp_starter::test_support::oauth_flow::{
     CLAUDE_CALLBACK, OWNER_PASSWORD, VERIFIER, authorize_params, set_param,
 };
 use mcp_starter::test_support::{raw_http, wait_until};
+use mcp_starter::work::Work;
 use serde_json::{Value, json};
 use support::Setup;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 const TOOLS_LIST: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
 const RESOURCE_METADATA: &str =
@@ -1047,4 +1053,51 @@ async fn tool_task_keeps_the_connection_slot_after_the_client_leaves() {
         "the only slot was free while the tool still ran: {:?}",
         started.elapsed()
     );
+}
+
+#[tokio::test]
+async fn custom_router_with_the_body_layer_answers_in_flight_requests_at_shutdown() {
+    let work = Work::new(TaskTracker::new());
+    let handler_started = Arc::new(AtomicBool::new(false));
+    let started = handler_started.clone();
+    let router = Router::new()
+        .route(
+            "/slow",
+            post(move || {
+                let started = started.clone();
+
+                async move {
+                    started.store(true, Ordering::SeqCst);
+                    sleep(Duration::from_millis(800)).await;
+
+                    "finished"
+                }
+            }),
+        )
+        .layer(middleware::from_fn_with_state(1 << 10, buffer_body));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let shutdown = CancellationToken::new();
+    let serving = tokio::spawn(serve(
+        work,
+        listener,
+        router,
+        ServerOptions::default(),
+        shutdown.clone(),
+    ));
+    let call =
+        tokio::spawn(async move { raw_http(&address, "POST", "/slow", &[], "{}", false).await });
+
+    wait_until(Duration::from_secs(5), "the handler to start", || {
+        handler_started.load(Ordering::SeqCst)
+    })
+    .await;
+    shutdown.cancel();
+
+    let (status, reply) = call.await.unwrap();
+
+    assert_eq!(status, 200, "{reply}");
+    assert!(reply.ends_with("finished"), "{reply}");
+
+    serving.await.unwrap();
 }

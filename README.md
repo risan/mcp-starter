@@ -88,15 +88,21 @@ Tools run through `tools::run_tool`, which spawns the body as tracked detached w
 for it until a deadline, and answers with a plain tool error when the deadline passes. A
 request the client drops does not cancel the body, and shutdown waits for it.
 
+A service that authenticates some other way builds its own router instead of `server::build_router`.
+It must put `server::buffer_body` on every route that reads a body, with
+`middleware::from_fn_with_state(limit, buffer_body)` inside its own auth layer: `server::serve`
+cuts a connection at shutdown unless that layer marked its request as read, so without it every
+request in flight is dropped.
+
 Dependencies: add the crate, and the test helpers (rigs, a fake clock, a throwaway TLS chain)
 only under `[dev-dependencies]`:
 
 ```toml
 [dependencies]
-mcp-starter = "0.1.3"
+mcp-starter = "0.1.4"
 
 [dev-dependencies]
-mcp-starter = { version = "0.1.3", features = ["test-support"] }
+mcp-starter = { version = "0.1.4", features = ["test-support"] }
 ```
 
 Moving an existing mfp-mcp-rs onto it: see [MIGRATING.md](MIGRATING.md).

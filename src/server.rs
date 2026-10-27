@@ -296,7 +296,13 @@ struct ConnControl {
 /// Reads the whole body first, with the route's cap, and then gives the reply its write
 /// window, so a slow upload cannot eat into it. Over the cap answers 413 before any
 /// handler, state change or password check runs.
-async fn buffer_body(State(limit): State<usize>, request: Request, next: Next) -> Response {
+///
+/// [`build_router`] applies it on every route. A service that builds its own router must apply
+/// it too, on every route that reads a body: [`serve`] closes a connection at shutdown unless
+/// this layer has marked its request as read, so without it every request in flight is cut off.
+/// Put it inside any layer that rejects a caller (`middleware::from_fn_with_state(limit,
+/// buffer_body)`), so an anonymous request never makes the server buffer a body.
+pub async fn buffer_body(State(limit): State<usize>, request: Request, next: Next) -> Response {
     let control = request.extensions().get::<Arc<ConnControl>>().cloned();
     let (parts, body) = request.into_parts();
 

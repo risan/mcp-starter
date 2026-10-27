@@ -94,15 +94,20 @@ It must put `server::buffer_body` on every route that reads a body, with
 cuts a connection at shutdown unless that layer marked its request as read, so without it every
 request in flight is dropped.
 
+A service that needs an HTTP route of its own (an upload page, say) builds it as an axum `Router`
+and passes it to `Serving::run_with_routes`. The routes are logged like the built-in ones and get
+no body cap unless they add `server::buffer_body` themselves; a route that checks access adds that
+check as a later `route_layer`, so it runs before the body is read.
+
 Dependencies: add the crate, and the test helpers (rigs, a fake clock, a throwaway TLS chain)
 only under `[dev-dependencies]`:
 
 ```toml
 [dependencies]
-mcp-starter = "0.1.4"
+mcp-starter = "0.1.5"
 
 [dev-dependencies]
-mcp-starter = { version = "0.1.4", features = ["test-support"] }
+mcp-starter = { version = "0.1.5", features = ["test-support"] }
 ```
 
 Moving an existing mfp-mcp-rs onto it: see [MIGRATING.md](MIGRATING.md).

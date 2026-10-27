@@ -8,6 +8,7 @@
 use std::io::{BufRead, Write};
 use std::sync::Arc;
 
+use axum::Router;
 use jiff::Timestamp;
 use rmcp::ServerHandler;
 use tokio::net::TcpListener;
@@ -17,7 +18,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::config::Config;
 use crate::oauth::{self, OAuth, bcrypt_checker};
-use crate::server::{ServerOptions, build_router, mcp_service, serve};
+use crate::server::{ServerOptions, build_router_with, mcp_service, serve};
 use crate::store::{Lease, Section, State, Store};
 use crate::work::Work;
 use crate::{ServiceInfo, system_clock};
@@ -226,6 +227,20 @@ impl<S: Section> Serving<S> {
     where
         H: ServerHandler + Send + 'static,
     {
+        self.run_with_routes(io, tools, Router::new()).await
+    }
+
+    /// [`Serving::run`] with the service's own HTTP `routes` next to the built-in ones; see
+    /// [`build_router_with`] for what they get and must avoid.
+    pub async fn run_with_routes<H>(
+        self,
+        io: &mut Io,
+        tools: impl Fn() -> H + Send + Sync + 'static,
+        routes: Router,
+    ) -> Result<Lease, String>
+    where
+        H: ServerHandler + Send + 'static,
+    {
         let address = self
             .listener
             .local_addr()
@@ -238,7 +253,7 @@ impl<S: Section> Serving<S> {
         );
 
         let mcp = mcp_service(&public_url, tools);
-        let router = build_router(self.info, self.oauth, self.work.clone(), mcp);
+        let router = build_router_with(self.info, self.oauth, self.work.clone(), mcp, routes);
 
         serve(
             self.work,

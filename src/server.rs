@@ -94,6 +94,24 @@ where
     S: Section,
     H: ServerHandler + Send + 'static,
 {
+    build_router_with(info, oauth, work, mcp, Router::new())
+}
+
+/// [`build_router`] plus the service's own `routes`. They are logged like every other route
+/// and sit outside the 64 KiB OAuth body layer, so they get no body cap unless they add
+/// [`buffer_body`] themselves. A path the built-in routes already use makes axum panic when
+/// the router is built.
+pub fn build_router_with<S, H>(
+    info: &'static ServiceInfo,
+    oauth: OAuth<S>,
+    work: Arc<Work>,
+    mcp: StreamableHttpService<H, NeverSessionManager>,
+    routes: Router,
+) -> Router
+where
+    S: Section,
+    H: ServerHandler + Send + 'static,
+{
     let public_url = oauth.issuer().to_string();
     let metadata_url = format!("{public_url}/.well-known/oauth-protected-resource");
     let resource_metadata = json!({
@@ -160,6 +178,7 @@ where
             buffer_body,
         ))
         .merge(mcp)
+        .merge(routes)
         .layer(middleware::from_fn(log_request))
 }
 

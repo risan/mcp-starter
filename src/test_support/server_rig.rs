@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use axum::Router;
 use rmcp::ServerHandler;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -15,7 +16,7 @@ use super::jsonrpc::McpClient;
 use super::oauth_flow::{CLAUDE_CALLBACK, OAuthClient, OWNER_PASSWORD, Probe, VERIFIER};
 use crate::config::Config;
 use crate::oauth::OAuth;
-use crate::server::{ServerOptions, build_router, mcp_service, serve};
+use crate::server::{ServerOptions, build_router_with, mcp_service, serve};
 use crate::store::{Change, Section, State, Store, StoreOptions};
 use crate::work::Work;
 use crate::{Clock, ServiceInfo};
@@ -28,6 +29,8 @@ pub struct RigSetup {
     pub store: StoreOptions,
     /// The public URL the server believes it is served at.
     pub public_url: String,
+    /// The service's own routes, served next to the built-in ones.
+    pub routes: Router,
 }
 
 impl Default for RigSetup {
@@ -36,6 +39,7 @@ impl Default for RigSetup {
             server: ServerOptions::default(),
             store: StoreOptions::default(),
             public_url: "https://mcp.example.com".to_string(),
+            routes: Router::new(),
         }
     }
 }
@@ -135,7 +139,7 @@ impl<S: Section> ServerRig<S> {
         };
         let tools = make_tools(&context);
         let mcp = mcp_service(&setup.public_url, tools);
-        let router = build_router(info, oauth, work.clone(), mcp);
+        let router = build_router_with(info, oauth, work.clone(), mcp, setup.routes);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let shutdown = CancellationToken::new();

@@ -4,12 +4,15 @@
 mod support;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::middleware;
-use axum::routing::post;
+use axum::extract::Request;
+use axum::http::StatusCode;
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use mcp_starter::server::{ServerOptions, buffer_body, serve};
 use mcp_starter::store::{Hooks, StoreOptions};
 use mcp_starter::test_support::jsonrpc::McpClient;
@@ -341,6 +344,123 @@ async fn unauthenticated_mcp_answered_before_body_is_read() {
             "{authorization:?}: {reply}"
         );
     }
+}
+
+fn with_routes(routes: Router) -> Setup {
+    Setup {
+        routes,
+        ..Setup::default()
+    }
+}
+
+#[tokio::test]
+async fn extra_route_served_next_to_the_built_in_ones() {
+    let routes = Router::new().route("/extra", get(|| async { "extra\n" }));
+    let rig = support::start_with(with_routes(routes)).await;
+
+    let (status, reply) = raw_http(&rig.address, "GET", "/extra", &[], "", false).await;
+
+    assert_eq!(status, 200);
+    assert!(reply.ends_with("extra\n"), "{reply}");
+
+    let (status, reply) = raw_http(&rig.address, "GET", "/healthz", &[], "", false).await;
+
+    assert_eq!(status, 200);
+    assert!(reply.ends_with("ok\n"), "{reply}");
+}
+
+#[tokio::test]
+async fn extra_route_with_buffer_body_answers_413_before_its_handler() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let routes = Router::new().route(
+        "/upload",
+        post(move || {
+            let counter = counter.clone();
+
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+
+                "stored"
+            }
+        })
+        .route_layer(middleware::from_fn_with_state(1024usize, buffer_body)),
+    );
+    let rig = support::start_with(with_routes(routes)).await;
+    let (status, _) = raw_http(
+        &rig.address,
+        "POST",
+        "/upload",
+        &[],
+        &"a".repeat(2048),
+        false,
+    )
+    .await;
+
+    assert_eq!(status, 413);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let (status, _) = raw_http(
+        &rig.address,
+        "POST",
+        "/upload",
+        &[],
+        &"a".repeat(512),
+        false,
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn oauth_body_cap_does_not_apply_to_extra_routes() {
+    let routes = Router::new().route(
+        "/upload",
+        post(|body: String| async move { body.len().to_string() })
+            .route_layer(middleware::from_fn_with_state(1usize << 20, buffer_body)),
+    );
+    let rig = support::start_with(with_routes(routes)).await;
+    let body = "a".repeat(100 * 1024);
+    let (status, reply) = raw_http(&rig.address, "POST", "/upload", &[], &body, false).await;
+
+    assert_eq!(status, 200);
+    assert!(reply.ends_with(&(100 * 1024).to_string()), "{reply}");
+}
+
+#[tokio::test]
+async fn access_check_added_after_buffer_body_answers_before_the_body_is_read() {
+    async fn refuse(_request: Request, _next: Next) -> Response {
+        StatusCode::NOT_FOUND.into_response()
+    }
+
+    let routes = Router::new().route(
+        "/upload",
+        post(|| async { "stored" })
+            .route_layer(middleware::from_fn_with_state(1usize << 20, buffer_body))
+            .route_layer(middleware::from_fn(refuse)),
+    );
+    let rig = support::start_with(with_routes(routes)).await;
+    let mut stream = TcpStream::connect(&rig.address).await.unwrap();
+    let head = format!(
+        "POST /upload HTTP/1.1\r\nhost: {}\r\ncontent-length: {}\r\n\r\n",
+        rig.address,
+        1024 * 1024
+    );
+
+    // The declared body never arrives: a route that buffered before its check would sit on
+    // the read until the connection's deadline.
+    stream.write_all(head.as_bytes()).await.unwrap();
+
+    let mut buffer = vec![0u8; 1024];
+    let read = timeout(Duration::from_secs(5), stream.read(&mut buffer))
+        .await
+        .expect("the 404 must not wait for the body")
+        .unwrap();
+    let reply = String::from_utf8_lossy(&buffer[..read]);
+
+    assert!(reply.starts_with("HTTP/1.1 404"), "{reply}");
 }
 
 #[tokio::test]

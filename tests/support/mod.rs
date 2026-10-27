@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use axum::Router;
 use mcp_starter::server::ServerOptions;
 use mcp_starter::store::StoreOptions;
 use mcp_starter::test_support::oauth_flow::OAuthRig;
@@ -29,6 +30,7 @@ pub struct Setup {
     pub server: ServerOptions,
     pub store: StoreOptions,
     pub public_url: String,
+    pub routes: Router,
 }
 
 impl Default for Setup {
@@ -38,6 +40,7 @@ impl Default for Setup {
             server: ServerOptions::default(),
             store: StoreOptions::default(),
             public_url: RigSetup::default().public_url,
+            routes: Router::new(),
         }
     }
 }
@@ -52,6 +55,7 @@ pub async fn start_with(setup: Setup) -> ServerRig<ExampleState> {
         server: setup.server,
         store: setup.store,
         public_url: setup.public_url,
+        routes: setup.routes,
     };
 
     ServerRig::start(

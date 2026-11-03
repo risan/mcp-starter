@@ -69,6 +69,21 @@ async fn waiting(db: &Db) -> i64 {
     .await
 }
 
+/// The prune runs after the exchange has answered, so its effect is waited for.
+async fn wait_for_count(db: &Db, sql: &str, expected: i64) {
+    let started = Instant::now();
+
+    while count(db, sql).await != expected {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "never reached {expected}, have {}",
+            count(db, sql).await
+        );
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 async fn wait_for_waiting(db: &Db, expected: i64) {
     let started = Instant::now();
 
@@ -524,6 +539,7 @@ async fn a_code_exchange_prunes_families_expired_over_an_hour_ago() {
         .exchange_code(grant("prune-1", "c", "42"), now())
         .await
         .unwrap();
+    wait_for_count(&db, old, 100).await;
 
     assert_eq!(count(&db, old).await, 100, "500 went");
     assert_eq!(
@@ -540,6 +556,7 @@ async fn a_code_exchange_prunes_families_expired_over_an_hour_ago() {
         .exchange_code(grant("prune-2", "c", "42"), now())
         .await
         .unwrap();
+    wait_for_count(&db, old, 0).await;
 
     assert_eq!(count(&db, old).await, 0, "the rest went");
     assert_eq!(
@@ -788,4 +805,56 @@ async fn the_whole_upstream_flow_runs_on_postgres() {
     rig.oauth.revoke_subject("42").await.unwrap();
 
     assert!(rig.oauth.verify(&tokens.access_token).await.is_err());
+}
+
+#[tokio::test]
+async fn a_blocked_prune_does_not_lose_the_token_pair() {
+    let Some(postgres) = Postgres::ready().await else {
+        return;
+    };
+    let store = postgres.store_with_limits(Duration::from_secs(1), Duration::from_secs(3));
+    let db = postgres.superuser().await;
+    let mut holder = postgres.superuser().await;
+    let at = now().as_second();
+
+    store.register_client(client("c"), now()).await.unwrap();
+    db.batch_execute(&format!(
+        "insert into oauth_families
+             values ('stuck', 'c', '42', 'Pat', 'example', '{RESOURCE}', {granted}, {old})",
+        granted = at - 10_000_000,
+        old = at - 7_200,
+    ))
+    .await
+    .unwrap();
+
+    // The prune wants to delete this family, and a lock holds it.
+    let blocked = holder.transaction().await.unwrap();
+
+    blocked
+        .query(
+            "select 1 from oauth_families where id = 'stuck' for update",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let started = Instant::now();
+    let issued = grant("pruned-around", "c", "42");
+    let granted = store.exchange_code(issued.clone(), now()).await.unwrap();
+
+    assert_eq!(granted, Granted::Issued(()));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the answer waited for the prune: {:?}",
+        started.elapsed()
+    );
+    assert!(verified(&store, &issued.tokens, now()).await);
+
+    blocked.commit().await.unwrap();
+    wait_for_count(
+        &db,
+        "select count(*) from oauth_families where id = 'stuck'",
+        0,
+    )
+    .await;
 }

@@ -65,6 +65,26 @@ struct Inner {
 }
 
 impl PgStore {
+    /// Removes some families that expired over an hour ago, a batch at a time, with a permit
+    /// and a deadline of its own.
+    async fn prune_families(&self, now: Timestamp) -> Result<(), StoreError> {
+        let cutoff = now.as_second() - PRUNE_AFTER_SECONDS;
+
+        self.run(async |database| {
+            database
+                .execute_typed(
+                    "delete from oauth_families
+                     where id in (select id from oauth_families where expires_at < $1 limit $2)
+                       and expires_at < $1",
+                    &[(&cutoff, Type::INT8), (&PRUNE_BATCH, Type::INT8)],
+                )
+                .await?;
+
+            Ok(())
+        })
+        .await
+    }
+
     /// TLS is required whatever the configuration's `sslmode` says, and the server's
     /// certificate must chain to `roots`. The connection asks the server to stop a statement
     /// or a lock wait after 10 seconds, so the database stops what this side gave up on.
@@ -274,24 +294,6 @@ async fn insert_pair(
     Ok(())
 }
 
-/// Removes some families that expired over an hour ago, a batch at a time. A failure is
-/// logged: the exchange it follows has already been committed.
-async fn prune_families(database: &Database, now: Timestamp) {
-    let cutoff = now.as_second() - PRUNE_AFTER_SECONDS;
-    let pruned = database
-        .execute_typed(
-            "delete from oauth_families
-             where id in (select id from oauth_families where expires_at < $1 limit $2)
-               and expires_at < $1",
-            &[(&cutoff, Type::INT8), (&PRUNE_BATCH, Type::INT8)],
-        )
-        .await;
-
-    if let Err(error) = pruned {
-        eprintln!("grant database prune failed: {}", database_cause(&error));
-    }
-}
-
 impl GrantStore for PgStore {
     async fn find_client(&self, id: &str) -> Result<Option<Client>, StoreError> {
         self.run(async |database| {
@@ -373,35 +375,47 @@ impl GrantStore for PgStore {
         grant: NewGrant,
         now: Timestamp,
     ) -> Result<Granted<()>, StoreError> {
-        self.run(async |database| {
-            let transaction = database.transaction().await?;
-            let found = transaction
-                .execute_typed(
-                    "update oauth_clients set last_used_at = $2 where client_id = $1",
-                    &[
-                        (&grant.client_id, Type::TEXT),
-                        (&now.as_second(), Type::INT8),
-                    ],
-                )
-                .await?;
+        let granted = self
+            .run(async |database| {
+                let transaction = database.transaction().await?;
+                let found = transaction
+                    .execute_typed(
+                        "update oauth_clients set last_used_at = $2 where client_id = $1",
+                        &[
+                            (&grant.client_id, Type::TEXT),
+                            (&now.as_second(), Type::INT8),
+                        ],
+                    )
+                    .await?;
 
-            if found == 0 {
-                return Ok(Granted::Refused);
-            }
+                if found == 0 {
+                    return Ok(Granted::Refused);
+                }
 
-            match insert_family(&transaction, &grant, now).await {
-                Ok(()) => {}
-                Err(error) if is_foreign_key_violation(&error) => return Ok(Granted::Refused),
-                Err(error) => return Err(error),
-            }
+                match insert_family(&transaction, &grant, now).await {
+                    Ok(()) => {}
+                    Err(error) if is_foreign_key_violation(&error) => return Ok(Granted::Refused),
+                    Err(error) => return Err(error),
+                }
 
-            insert_pair(&transaction, &grant.family, &grant.tokens).await?;
-            transaction.commit().await?;
-            prune_families(database, now).await;
+                insert_pair(&transaction, &grant.family, &grant.tokens).await?;
+                transaction.commit().await?;
 
-            Ok(Granted::Issued(()))
-        })
-        .await
+                Ok(Granted::Issued(()))
+            })
+            .await?;
+
+        // After the answer is settled and on its own: a blocked prune must not turn a committed
+        // grant into an error. `run` logs its failure.
+        if granted == Granted::Issued(()) {
+            let store = self.clone();
+
+            tokio::spawn(async move {
+                let _ = store.prune_families(now).await;
+            });
+        }
+
+        Ok(granted)
     }
 
     async fn rotate_refresh(

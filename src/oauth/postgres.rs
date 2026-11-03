@@ -47,8 +47,14 @@ struct Connection {
     _driver: AbortOnDropHandle<()>,
 }
 
-/// The grants of a service, in Postgres.
+/// The grants of a service, in Postgres. A clone shares the permits and everything else, so a
+/// service's test rig can keep a handle after the store is given to [`OAuth`](super::OAuth).
+#[derive(Clone)]
 pub struct PgStore {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
     config: tokio_postgres::Config,
     tls: MakeRustlsConnect,
     permits: Semaphore,
@@ -104,13 +110,15 @@ impl PgStore {
         .with_no_client_auth();
 
         PgStore {
-            config,
-            tls: MakeRustlsConnect::new(tls),
-            permits: Semaphore::new(PERMITS),
-            permit_wait,
-            deadline,
-            #[cfg(feature = "test-support")]
-            seeded: Mutex::new(Default::default()),
+            inner: Arc::new(Inner {
+                config,
+                tls: MakeRustlsConnect::new(tls),
+                permits: Semaphore::new(PERMITS),
+                permit_wait,
+                deadline,
+                #[cfg(feature = "test-support")]
+                seeded: Mutex::new(Default::default()),
+            }),
         }
     }
 
@@ -118,14 +126,15 @@ impl PgStore {
     /// database. For tests of a service's tools; it carries no stability promise.
     #[cfg(feature = "test-support")]
     pub fn seed_bearer(&self, token: &str, info: TokenInfo) {
-        self.seeded
+        self.inner
+            .seeded
             .lock()
             .unwrap()
             .insert(super::hash_token(token), info);
     }
 
     async fn connect(&self) -> Result<Connection, tokio_postgres::Error> {
-        let (client, connection) = self.config.connect(self.tls.clone()).await?;
+        let (client, connection) = self.inner.config.connect(self.inner.tls.clone()).await?;
         let driver = AbortOnDropHandle::new(tokio::spawn(async move {
             let _ = connection.await;
         }));
@@ -143,7 +152,12 @@ impl PgStore {
         &self,
         work: impl AsyncFnOnce(&mut Database) -> Result<T, tokio_postgres::Error>,
     ) -> Result<T, StoreError> {
-        let permit = match tokio::time::timeout(self.permit_wait, self.permits.acquire()).await {
+        let permit = match tokio::time::timeout(
+            self.inner.permit_wait,
+            self.inner.permits.acquire(),
+        )
+        .await
+        {
             Ok(Ok(permit)) => permit,
             _ => {
                 eprintln!("grant database busy");
@@ -153,7 +167,7 @@ impl PgStore {
                 ));
             }
         };
-        let outcome = tokio::time::timeout(self.deadline, async {
+        let outcome = tokio::time::timeout(self.inner.deadline, async {
             let mut connection = self.connect().await?;
 
             work(&mut connection.client).await
@@ -533,7 +547,7 @@ impl GrantStore for PgStore {
         now: Timestamp,
     ) -> Result<Option<TokenInfo>, StoreError> {
         #[cfg(feature = "test-support")]
-        if let Some(info) = self.seeded.lock().unwrap().get(token_hash) {
+        if let Some(info) = self.inner.seeded.lock().unwrap().get(token_hash) {
             return Ok(Some(info.clone()));
         }
 

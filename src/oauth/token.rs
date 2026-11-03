@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ACCESS_TTL, CodeRecord, GrantStore, Granted, NewGrant, NewTokens, OAuth, OAuthError,
-    REFRESH_TTL, Rotation, hash_token, json_response, parse_pairs, random_token,
+    REFRESH_TTL, Rotation, constant_time_eq, hash_token, json_response, parse_pairs, random_token,
 };
 use crate::work::ConnPermit;
 
@@ -118,15 +118,6 @@ fn pkce_matches(challenge: &str, verifier: &str) -> bool {
     let computed = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
 
     constant_time_eq(computed.as_bytes(), challenge.as_bytes())
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
 }
 
 /// A fresh token pair: the raw values for the client and the hashes for the store.

@@ -6,6 +6,9 @@ mod authorize;
 mod register;
 mod state_file;
 mod token;
+mod upstream;
+
+pub use upstream::{Pending, PendingError, SignIn, Upstream};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -26,6 +29,7 @@ use sha2::{Digest, Sha256};
 use crate::store::{Change, Client, Section, Store, StoreError};
 use crate::work::{ShuttingDown, Work};
 use crate::{Clock, ServiceInfo};
+use authorize::AuthRequest;
 
 const ACCESS_TTL: SignedDuration = SignedDuration::from_hours(24);
 const REFRESH_TTL: SignedDuration = SignedDuration::from_hours(60 * 24);
@@ -124,8 +128,8 @@ pub struct NewGrant {
     /// The person the code was approved for.
     pub subject: Subject,
     /// The owner password hash the approval was checked against; the grant is refused when
-    /// the owner password has changed since.
-    pub owner_hash: String,
+    /// the owner password has changed since. `None` for a person who signed in upstream.
+    pub owner_hash: Option<String>,
     /// The first token pair.
     pub tokens: NewTokens,
 }
@@ -219,10 +223,34 @@ pub trait GrantStore: Send + Sync + 'static {
 
     /// The bcrypt hash of the owner password; empty when none is set.
     fn owner_password_hash(&self) -> impl Future<Output = Result<String, StoreError>> + Send;
+
+    /// Whether this person approved this client on the consent page before.
+    fn has_consent(
+        &self,
+        subject: &str,
+        client_id: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+
+    /// Remembers that this person approved this client. A client that is gone is ignored: its
+    /// codes cannot be exchanged anyway.
+    fn save_consent(
+        &self,
+        subject: &str,
+        client_id: &str,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Deletes every token of this person. Remembered consents stay: a consent is trust in a
+    /// client, not a grant.
+    fn revoke_subject(
+        &self,
+        subject: &str,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
-/// A pending CSRF token or authorization code, held in memory only.
-trait Pending {
+/// A pending CSRF token, authorization code, sign-in or consent ticket, held in memory only.
+trait Expiring {
     fn expires(&self) -> Timestamp;
     fn seq(&self) -> u64;
 }
@@ -233,7 +261,7 @@ struct CsrfRecord {
     seq: u64,
 }
 
-impl Pending for CsrfRecord {
+impl Expiring for CsrfRecord {
     fn expires(&self) -> Timestamp {
         self.expires
     }
@@ -252,12 +280,13 @@ struct CodeRecord {
     subject: Subject,
     /// The owner password hash the approval was checked against. A password change makes
     /// the code worthless, including one approved by an attempt that was already queued.
-    owner_hash: String,
+    /// `None` when the person signed in upstream.
+    owner_hash: Option<String>,
     expires: Timestamp,
     seq: u64,
 }
 
-impl Pending for CodeRecord {
+impl Expiring for CodeRecord {
     fn expires(&self) -> Timestamp {
         self.expires
     }
@@ -269,7 +298,7 @@ impl Pending for CodeRecord {
 
 /// Adds a record, first dropping expired ones and then the oldest until there is room, so
 /// the map never exceeds `MAX_PENDING`.
-fn insert_bounded<R: Pending>(
+fn insert_bounded<R: Expiring>(
     records: &mut HashMap<String, R>,
     key: String,
     record: R,
@@ -292,11 +321,51 @@ fn insert_bounded<R: Pending>(
     records.insert(key, record);
 }
 
+/// An upstream sign-in that has begun and not come back, bound to the browser that began it.
+struct SignInRecord {
+    request: AuthRequest,
+    browser: String,
+    started_at: Timestamp,
+    expires: Timestamp,
+    seq: u64,
+}
+
+impl Expiring for SignInRecord {
+    fn expires(&self) -> Timestamp {
+        self.expires
+    }
+
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
+/// A consent page that was shown and not answered yet.
+struct ConsentRecord {
+    request: AuthRequest,
+    subject: Subject,
+    browser: String,
+    expires: Timestamp,
+    seq: u64,
+}
+
+impl Expiring for ConsentRecord {
+    fn expires(&self) -> Timestamp {
+        self.expires
+    }
+
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
 #[derive(Default)]
 struct PendingState {
     seq: u64,
     csrf: HashMap<String, CsrfRecord>,
     codes: HashMap<String, CodeRecord>,
+    sign_ins: HashMap<String, SignInRecord>,
+    consents: HashMap<String, ConsentRecord>,
     failures: Vec<Timestamp>,
     locked_until: Option<Timestamp>,
 }
@@ -307,7 +376,7 @@ struct Inner<St> {
     issuer: String,
     resource: String,
     clock: Clock,
-    checker: PasswordChecker,
+    sign_in: SignIn,
     work: Arc<Work>,
     pending: Mutex<PendingState>,
     /// Held across the lockout check, the password check and its bookkeeping.
@@ -338,7 +407,7 @@ impl<St: GrantStore> OAuth<St> {
         store: St,
         issuer: &str,
         clock: Clock,
-        checker: PasswordChecker,
+        sign_in: SignIn,
         work: Arc<Work>,
     ) -> OAuth<St> {
         OAuth {
@@ -348,7 +417,7 @@ impl<St: GrantStore> OAuth<St> {
                 issuer: issuer.to_string(),
                 resource: format!("{issuer}/mcp"),
                 clock,
-                checker,
+                sign_in,
                 work,
                 pending: Mutex::new(PendingState::default()),
                 password_lock: tokio::sync::Mutex::new(()),
@@ -394,6 +463,31 @@ impl<St: GrantStore> OAuth<St> {
         let pending = self.pending();
 
         (pending.csrf.len(), pending.codes.len())
+    }
+
+    /// How many upstream sign-ins and consent tickets are waiting in memory.
+    pub fn pending_sign_in_counts(&self) -> (usize, usize) {
+        let pending = self.pending();
+
+        (pending.sign_ins.len(), pending.consents.len())
+    }
+
+    /// Drops what is waiting in memory for this person: authorization codes that were issued
+    /// and consent tickets that were shown. For a service that deletes the person's grants
+    /// itself, such as through a foreign key in its own transaction.
+    pub fn forget_subject(&self, id: &str) {
+        let mut pending = self.pending();
+
+        pending.codes.retain(|_, record| record.subject.id != id);
+        pending.consents.retain(|_, record| record.subject.id != id);
+    }
+
+    /// Ends this person's grants: [`OAuth::forget_subject`], then every token in the store.
+    /// Their remembered consents stay.
+    pub async fn revoke_subject(&self, id: &str) -> Result<(), StoreError> {
+        self.forget_subject(id);
+
+        self.inner.store.revoke_subject(id, self.now()).await
     }
 
     /// Checks a bearer access token against the store. A token issued for another resource
@@ -454,6 +548,15 @@ pub async fn revoke_all<S: Section>(store: &Store<S>) -> Result<(), StoreError> 
             Change::Write(())
         })
         .await
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
 }
 
 fn random_token(bytes: usize) -> String {

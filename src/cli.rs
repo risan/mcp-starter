@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::config::Config;
-use crate::oauth::{self, OAuth, bcrypt_checker};
+use crate::oauth::{self, OAuth, SignIn, bcrypt_checker};
 use crate::server::{ServerOptions, build_router_with, mcp_service, serve};
 use crate::store::{Lease, Section, State, Store};
 use crate::work::Work;
@@ -194,7 +194,7 @@ impl<S: Section> Serving<S> {
             store.clone(),
             &config.public_url,
             system_clock(),
-            bcrypt_checker(),
+            SignIn::Password(bcrypt_checker()),
             work.clone(),
         );
         let listener = TcpListener::bind(&config.listen)

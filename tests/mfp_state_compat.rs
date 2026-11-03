@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use jiff::Timestamp;
 use mcp_starter::ServiceInfo;
-use mcp_starter::oauth::{OAuth, Subject, bcrypt_checker};
+use mcp_starter::oauth::{OAuth, SignIn, Subject, bcrypt_checker};
 use mcp_starter::store::{Change, Section, Store, StoreOptions, TokenKind};
 use mcp_starter::test_support::TestClock;
 use mcp_starter::test_support::oauth_flow::{ISSUER, OAuthClient};
@@ -239,7 +239,7 @@ fn mfp_oauth(store: &Store<MfpSection>, issuer: &str) -> OAuth<Store<MfpSection>
         store.clone(),
         issuer,
         clock.as_clock(),
-        bcrypt_checker(),
+        SignIn::Password(bcrypt_checker()),
         Work::new(TaskTracker::new()),
     )
 }

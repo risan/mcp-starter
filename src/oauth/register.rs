@@ -89,6 +89,7 @@ async fn register_client<St: GrantStore>(oauth: OAuth<St>, body: Bytes) -> Respo
         redirect_uris: request.redirect_uris,
         registered_at: now,
         last_used_at: None,
+        consented_subjects: Vec::new(),
         extra: Default::default(),
     };
     let saved = oauth.inner.store.register_client(client.clone(), now).await;

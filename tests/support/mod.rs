@@ -20,6 +20,10 @@ pub async fn rig() -> OAuthRig<ExampleState> {
     OAuthRig::start(&INFO).await
 }
 
+pub async fn upstream_rig() -> OAuthRig<ExampleState> {
+    OAuthRig::start_upstream(&INFO).await
+}
+
 pub async fn rig_with(options: StoreOptions) -> OAuthRig<ExampleState> {
     OAuthRig::start_with(&INFO, options).await
 }

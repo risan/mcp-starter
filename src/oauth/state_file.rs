@@ -75,8 +75,16 @@ fn evict_client<S>(state: &mut StoreState<S>, keep: &str) -> bool {
 }
 
 /// The owner is stored as an empty subject, so a single-owner state file never changes shape.
+fn stored_id(id: &str) -> String {
+    if id == Subject::owner().id {
+        return String::new();
+    }
+
+    id.to_string()
+}
+
 fn stored_subject(subject: &Subject) -> (String, String) {
-    if *subject == Subject::owner() {
+    if subject.id == Subject::owner().id {
         return (String::new(), String::new());
     }
 
@@ -173,7 +181,10 @@ impl<S: Section> GrantStore for Store<S> {
         now: Timestamp,
     ) -> Result<Granted<()>, StoreError> {
         self.update(move |state| {
-            if state.owner.password_hash != grant.owner_hash {
+            if grant
+                .owner_hash
+                .is_some_and(|hash| state.owner.password_hash != hash)
+            {
                 return Change::Unchanged(Granted::Refused);
             }
 
@@ -345,5 +356,56 @@ impl<S: Section> GrantStore for Store<S> {
 
     async fn owner_password_hash(&self) -> Result<String, StoreError> {
         self.read(|state| state.owner.password_hash.clone()).await
+    }
+
+    async fn has_consent(&self, subject: &str, client_id: &str) -> Result<bool, StoreError> {
+        let (subject, client_id) = (subject.to_string(), client_id.to_string());
+
+        self.read(move |state| {
+            state
+                .clients
+                .get(&client_id)
+                .is_some_and(|client| client.consented_subjects.contains(&subject))
+        })
+        .await
+    }
+
+    async fn save_consent(
+        &self,
+        subject: &str,
+        client_id: &str,
+        _now: Timestamp,
+    ) -> Result<(), StoreError> {
+        let (subject, client_id) = (subject.to_string(), client_id.to_string());
+
+        self.update(move |state| {
+            let Some(client) = state.clients.get_mut(&client_id) else {
+                return Change::Unchanged(());
+            };
+
+            if client.consented_subjects.contains(&subject) {
+                return Change::Unchanged(());
+            }
+
+            client.consented_subjects.push(subject);
+
+            Change::Write(())
+        })
+        .await
+    }
+
+    async fn revoke_subject(&self, subject: &str, now: Timestamp) -> Result<(), StoreError> {
+        let stored_id = stored_id(subject);
+
+        self.update(move |state| {
+            let before = state.tokens.len();
+
+            state.tokens.retain(|_, token| token.subject != stored_id);
+
+            let pruned = prune_tokens(state, now);
+
+            changed_if(state.tokens.len() != before || pruned, ())
+        })
+        .await
     }
 }

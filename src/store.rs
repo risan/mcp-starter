@@ -135,6 +135,10 @@ pub struct Client {
     /// When a token was last issued to the client.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<Timestamp>,
+    /// The ids of the people who approved this client on the consent page. A single-owner
+    /// server never fills it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consented_subjects: Vec<String>,
     /// Fields this crate does not know, kept as they are.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -1192,6 +1196,7 @@ mod tests {
                         redirect_uris: vec!["https://claude.ai/api/mcp/auth_callback".into()],
                         registered_at: registered,
                         last_used_at: None,
+                        consented_subjects: Vec::new(),
                         extra: Map::new(),
                     },
                 );
@@ -1733,6 +1738,7 @@ mod tests {
                 redirect_uris: Vec::new(),
                 registered_at: registered,
                 last_used_at: None,
+                consented_subjects: Vec::new(),
                 extra: Map::new(),
             },
         );

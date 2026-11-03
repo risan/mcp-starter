@@ -4,7 +4,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::ThreadId;
 
-use axum::http::HeaderMap;
+use axum::Router;
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
 use jiff::Timestamp;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -15,7 +19,7 @@ use tokio_util::task::TaskTracker;
 
 use super::TestClock;
 use crate::ServiceInfo;
-use crate::oauth::{OAuth, PasswordChecker};
+use crate::oauth::{GrantStore, OAuth, PasswordChecker, SignIn, Subject, Upstream};
 use crate::store::{Change, Section, Store, StoreOptions};
 use crate::work::Work;
 
@@ -25,6 +29,8 @@ pub const ISSUER: &str = "https://mcp.example.com";
 pub const OWNER_PASSWORD: &str = "correct horse battery staple";
 /// The one non-loopback redirect URI a client may register.
 pub const CLAUDE_CALLBACK: &str = "https://claude.ai/api/mcp/auth_callback";
+/// The name of the cookie that binds a sign-in to the browser that started it.
+pub const SIGN_IN_COOKIE: &str = "__Host-mcp-sign-in";
 /// A valid PKCE verifier.
 pub const VERIFIER: &str = "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv";
 
@@ -62,6 +68,20 @@ impl Reply {
             .as_str()
             .unwrap_or_default()
             .to_string()
+    }
+
+    /// The value of the browser-binding cookie the reply sets.
+    pub fn sign_in_cookie(&self) -> Option<String> {
+        self.headers
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find_map(|cookie| {
+                cookie
+                    .strip_prefix(&format!("{SIGN_IN_COOKIE}="))
+                    .and_then(|rest| rest.split(';').next())
+                    .map(str::to_string)
+            })
     }
 
     /// A query parameter of the `Location` header.
@@ -393,6 +413,151 @@ impl OAuthClient {
         (reply, tokens)
     }
 
+    /// A GET as the browser that holds `cookie`.
+    pub async fn get_as(&self, path: &str, cookie: Option<&str>) -> Reply {
+        let mut request = self.http.get(format!("{}{path}", self.base));
+
+        if let Some(cookie) = cookie {
+            request = request.header("cookie", format!("{SIGN_IN_COOKIE}={cookie}"));
+        }
+
+        OAuthClient::reply(request.send().await.unwrap()).await
+    }
+
+    /// A form POST as the browser that holds `cookie`.
+    pub async fn post_form_as(
+        &self,
+        path: &str,
+        pairs: &[(String, String)],
+        cookie: Option<&str>,
+    ) -> Reply {
+        let mut request = self
+            .http
+            .post(format!("{}{path}", self.base))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(serde_urlencoded::to_string(pairs).unwrap());
+
+        if let Some(cookie) = cookie {
+            request = request.header("cookie", format!("{SIGN_IN_COOKIE}={cookie}"));
+        }
+
+        OAuthClient::reply(request.send().await.unwrap()).await
+    }
+
+    /// `GET /authorize` on an upstream server as the browser that holds `cookie` (a new
+    /// browser when `None`). Returns the reply.
+    pub async fn authorize_as(&self, params: &Pairs, cookie: Option<&str>) -> Reply {
+        let query = serde_urlencoded::to_string(params).unwrap();
+
+        self.get_as(&format!("/authorize?{query}"), cookie).await
+    }
+
+    /// Starts a sign-in and returns the pending id and the browser's cookie.
+    pub async fn start_sign_in(
+        &self,
+        client_id: &str,
+        redirect: &str,
+        cookie: Option<&str>,
+    ) -> (String, String) {
+        let reply = self
+            .authorize_as(&self.authorize_params(client_id, redirect), cookie)
+            .await;
+
+        assert_eq!(reply.status, 302, "authorize: {}", reply.body);
+
+        let location = reply.header("location");
+        let pending = reply
+            .location_param("pending")
+            .unwrap_or_else(|| panic!("no pending id in {location}"));
+
+        (pending, reply.sign_in_cookie().expect("a sign-in cookie"))
+    }
+
+    /// The service's callback: `subject` called `name` finished signing in.
+    pub async fn finish_sign_in(
+        &self,
+        pending: &str,
+        cookie: Option<&str>,
+        subject: &str,
+        name: &str,
+    ) -> Reply {
+        let query = serde_urlencoded::to_string([
+            ("pending", pending),
+            ("subject", subject),
+            ("name", name),
+        ])
+        .unwrap();
+
+        self.get_as(&format!("/upstream/callback?{query}"), cookie)
+            .await
+    }
+
+    /// The service's callback: the upstream refused the sign-in.
+    pub async fn deny_sign_in(&self, pending: &str, cookie: Option<&str>) -> Reply {
+        let query = serde_urlencoded::to_string([("pending", pending), ("deny", "1")]).unwrap();
+
+        self.get_as(&format!("/upstream/callback?{query}"), cookie)
+            .await
+    }
+
+    /// Starts a sign-in and finishes it as `subject`. Returns the browser's cookie and the
+    /// reply of the callback: the consent page or the redirect with a code.
+    pub async fn sign_in(
+        &self,
+        client_id: &str,
+        redirect: &str,
+        subject: &str,
+        name: &str,
+    ) -> (String, Reply) {
+        let (pending, cookie) = self.start_sign_in(client_id, redirect, None).await;
+        let reply = self
+            .finish_sign_in(&pending, Some(&cookie), subject, name)
+            .await;
+
+        (cookie, reply)
+    }
+
+    /// The consent ticket in a consent page.
+    pub fn consent_ticket(reply: &Reply) -> Option<String> {
+        let marker = "name=\"ticket\" value=\"";
+        let start = reply.body.find(marker)? + marker.len();
+        let rest = &reply.body[start..];
+
+        Some(rest[..rest.find('"')?].to_string())
+    }
+
+    /// Posts the consent page's `decision` (`allow` or `cancel`) for `ticket`.
+    pub async fn decide(&self, ticket: &str, decision: &str, cookie: Option<&str>) -> Reply {
+        self.post_form_as(
+            "/authorize",
+            &pairs(&[("ticket", ticket), ("decision", decision)]),
+            cookie,
+        )
+        .await
+    }
+
+    /// Signs in as `subject`, clicks Allow when the consent page shows, and returns the
+    /// browser's cookie and the code.
+    pub async fn upstream_grant(
+        &self,
+        client_id: &str,
+        redirect: &str,
+        subject: &str,
+        name: &str,
+    ) -> (String, String) {
+        let (cookie, mut reply) = self.sign_in(client_id, redirect, subject, name).await;
+
+        if let Some(ticket) = OAuthClient::consent_ticket(&reply) {
+            reply = self.decide(&ticket, "allow", Some(&cookie)).await;
+        }
+
+        let code = reply
+            .location_param("code")
+            .unwrap_or_else(|| panic!("no code ({}): {}", reply.status, reply.body));
+
+        (cookie, code)
+    }
+
     /// A registered client with a fresh token pair, and the code that produced it.
     pub async fn full_flow(&self) -> (String, Tokens, String) {
         self.full_flow_with_password(OWNER_PASSWORD).await
@@ -421,6 +586,49 @@ impl OAuthClient {
 
         (client_id, tokens.unwrap(), code)
     }
+}
+
+/// The upstream the test rigs send browsers to.
+pub struct TestUpstream;
+
+impl Upstream for TestUpstream {
+    fn sign_in_url(&self, pending: &str) -> String {
+        format!("https://upstream.example/sign-in?pending={pending}")
+    }
+}
+
+/// The OAuth routes plus `GET /upstream/callback?pending=&subject=&name=&deny=`, which plays
+/// the service's callback: it takes the pending sign-in, then denies it when `deny` is
+/// present and otherwise completes it for `subject` called `name`.
+pub fn upstream_routes<St: GrantStore>(oauth: OAuth<St>) -> Router {
+    let callback = Router::new()
+        .route("/upstream/callback", get(upstream_callback::<St>))
+        .with_state(oauth.clone());
+
+    oauth.routes().merge(callback)
+}
+
+async fn upstream_callback<St: GrantStore>(
+    State(oauth): State<OAuth<St>>,
+    headers: HeaderMap,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let field = |name: &str| query.get(name).cloned().unwrap_or_default();
+    let pending = match oauth.take_pending(&headers, &field("pending")) {
+        Ok(pending) => pending,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+
+    if query.contains_key("deny") {
+        return oauth.deny(pending);
+    }
+
+    let subject = Subject {
+        id: field("subject"),
+        name: field("name"),
+    };
+
+    oauth.complete(pending, subject).await
 }
 
 /// Form fields from string pairs.
@@ -459,6 +667,7 @@ pub struct OAuthRig<S> {
     /// The detached work the server starts.
     pub work: Arc<Work>,
     info: &'static ServiceInfo,
+    upstream: bool,
     server: JoinHandle<()>,
 }
 
@@ -468,8 +677,21 @@ impl<S: Section> OAuthRig<S> {
         OAuthRig::start_with(info, StoreOptions::default()).await
     }
 
+    /// A rig whose sign-in goes to [`TestUpstream`]: the routes are [`upstream_routes`].
+    pub async fn start_upstream(info: &'static ServiceInfo) -> OAuthRig<S> {
+        OAuthRig::start_in(info, StoreOptions::default(), true).await
+    }
+
     /// A rig with the given store options.
     pub async fn start_with(info: &'static ServiceInfo, options: StoreOptions) -> OAuthRig<S> {
+        OAuthRig::start_in(info, options, false).await
+    }
+
+    async fn start_in(
+        info: &'static ServiceInfo,
+        options: StoreOptions,
+        upstream: bool,
+    ) -> OAuthRig<S> {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), options).unwrap();
         let hash = bcrypt::hash(OWNER_PASSWORD, 4).unwrap();
@@ -486,7 +708,8 @@ impl<S: Section> OAuthRig<S> {
         let clock = TestClock::new("2026-10-24T09:00:00Z");
         let probe = Arc::new(Probe::default());
         let work = Work::new(TaskTracker::new());
-        let (oauth, client, server) = OAuthRig::serve(info, &store, &clock, &probe, &work).await;
+        let (oauth, client, server) =
+            OAuthRig::serve(info, &store, &clock, &probe, &work, upstream).await;
 
         OAuthRig {
             dir,
@@ -497,6 +720,7 @@ impl<S: Section> OAuthRig<S> {
             probe,
             work,
             info,
+            upstream,
             server,
         }
     }
@@ -507,18 +731,28 @@ impl<S: Section> OAuthRig<S> {
         clock: &TestClock,
         probe: &Arc<Probe>,
         work: &Arc<Work>,
+        upstream: bool,
     ) -> (OAuth<Store<S>>, OAuthClient, JoinHandle<()>) {
+        let sign_in = if upstream {
+            SignIn::Upstream(Arc::new(TestUpstream))
+        } else {
+            SignIn::Password(probe.checker())
+        };
         let oauth = OAuth::new(
             info,
             store.clone(),
             ISSUER,
             clock.as_clock(),
-            probe.checker(),
+            sign_in,
             work.clone(),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let router = oauth.routes();
+        let router = if upstream {
+            upstream_routes(oauth.clone())
+        } else {
+            oauth.routes()
+        };
         let server = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
@@ -534,8 +768,15 @@ impl<S: Section> OAuthRig<S> {
     pub async fn restart(&mut self) {
         self.server.abort();
 
-        let (oauth, client, server) =
-            OAuthRig::serve(self.info, &self.store, &self.clock, &self.probe, &self.work).await;
+        let (oauth, client, server) = OAuthRig::serve(
+            self.info,
+            &self.store,
+            &self.clock,
+            &self.probe,
+            &self.work,
+            self.upstream,
+        )
+        .await;
 
         self.oauth = oauth;
         self.client = client;

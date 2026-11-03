@@ -385,7 +385,8 @@ struct Inner<St> {
     pending: Mutex<PendingState>,
     /// Held across the lockout check, the password check and its bookkeeping.
     password_lock: tokio::sync::Mutex<()>,
-    /// Held from the code lookup through the store commit that issues the tokens.
+    /// Held from the code lookup through the store commit that issues the tokens, and by
+    /// `revoke_subject`, so the two never interleave.
     grant_lock: tokio::sync::Mutex<()>,
 }
 
@@ -488,7 +489,12 @@ impl<St: GrantStore> OAuth<St> {
 
     /// Ends this person's grants: [`OAuth::forget_subject`], then every token in the store.
     /// Their remembered consents stay.
+    ///
+    /// It waits for a code exchange that is under way: an exchange has taken its code before it
+    /// writes its tokens, so without the wait it could write them after the delete.
     pub async fn revoke_subject(&self, id: &str) -> Result<(), StoreError> {
+        let _exchanges = self.inner.grant_lock.lock().await;
+
         self.forget_subject(id);
 
         self.inner.store.revoke_subject(id, self.now()).await

@@ -3,6 +3,8 @@
 //! only their SHA-256 is stored.
 
 mod authorize;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 mod register;
 mod state_file;
 mod token;
@@ -548,6 +550,11 @@ pub async fn revoke_all<S: Section>(store: &Store<S>) -> Result<(), StoreError> 
             Change::Write(())
         })
         .await
+}
+
+/// Records written before tokens carried a resource have none; they stay valid.
+fn is_for_resource(record_resource: &str, resource: &str) -> bool {
+    record_resource.is_empty() || record_resource == resource
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {

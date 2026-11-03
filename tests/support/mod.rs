@@ -9,6 +9,10 @@ use mcp_starter::test_support::oauth_flow::OAuthRig;
 use mcp_starter::test_support::server_rig::{RigSetup, ServerRig};
 use std::sync::Arc;
 
+pub mod grant_store;
+#[cfg(feature = "postgres")]
+pub mod postgres;
+
 #[path = "../../examples/minimal/service.rs"]
 pub mod example;
 

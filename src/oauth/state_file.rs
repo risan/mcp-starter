@@ -4,17 +4,15 @@ use std::collections::BTreeSet;
 
 use jiff::Timestamp;
 
-use super::{GrantStore, Granted, NewGrant, NewTokens, Registered, Rotation, Subject, TokenInfo};
+use super::{
+    GrantStore, Granted, NewGrant, NewTokens, Registered, Rotation, Subject, TokenInfo,
+    is_for_resource,
+};
 use crate::store::{
     Change, Client, Section, State as StoreState, Store, StoreError, Token, TokenKind,
 };
 
 const MAX_CLIENTS: usize = 50;
-
-/// Records written before tokens carried a resource have none; they stay valid.
-fn is_for_resource(record_resource: &str, resource: &str) -> bool {
-    record_resource.is_empty() || record_resource == resource
-}
 
 /// Drops expired tokens. A rotated refresh record stays only while its family still has a
 /// live token, so replaying it keeps revoking the descendants; a family with nothing live

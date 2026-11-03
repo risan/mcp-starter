@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use super::register::{parse_loopback, redirect_matches};
 use super::{
     CODE_TTL, CSRF_TTL, CodeRecord, CsrfRecord, GrantStore, LOCKOUT_FAILS, LOCKOUT_WINDOW, OAuth,
-    OFFLINE_ACCESS, hash_token, insert_bounded, parse_pairs, random_token,
+    OFFLINE_ACCESS, Subject, hash_token, insert_bounded, parse_pairs, random_token,
 };
 use crate::store::Client;
 use crate::work::ConnPermit;
@@ -318,6 +318,7 @@ impl<St: GrantStore> OAuth<St> {
             challenge: request.code_challenge,
             scope,
             resource,
+            subject: Subject::owner(),
             owner_hash: hash,
             expires: now + CODE_TTL,
             seq: pending.seq,

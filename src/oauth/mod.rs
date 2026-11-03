@@ -46,11 +46,32 @@ pub fn bcrypt_checker() -> PasswordChecker {
     Arc::new(|hash, password| bcrypt::verify(password, hash).unwrap_or(false))
 }
 
+/// The person a grant belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subject {
+    /// An opaque id, stable for the person.
+    pub id: String,
+    /// The name to show people.
+    pub name: String,
+}
+
+impl Subject {
+    /// The owner of a single-owner server, who signs in with the password.
+    pub fn owner() -> Subject {
+        Subject {
+            id: "owner".to_string(),
+            name: "Owner".to_string(),
+        }
+    }
+}
+
 /// What a valid access token grants.
 #[derive(Debug, Clone)]
 pub struct TokenInfo {
     /// The scope the token was issued with.
     pub scope: String,
+    /// The person the token was issued to.
+    pub subject: Subject,
     /// When the token stops working.
     pub expires_at: Timestamp,
 }
@@ -100,6 +121,8 @@ pub struct NewGrant {
     pub scope: String,
     /// The MCP resource URL the tokens are bound to.
     pub resource: String,
+    /// The person the code was approved for.
+    pub subject: Subject,
     /// The owner password hash the approval was checked against; the grant is refused when
     /// the owner password has changed since.
     pub owner_hash: String,
@@ -226,6 +249,7 @@ struct CodeRecord {
     challenge: String,
     scope: String,
     resource: String,
+    subject: Subject,
     /// The owner password hash the approval was checked against. A password change makes
     /// the code worthless, including one approved by an attempt that was already queued.
     owner_hash: String,

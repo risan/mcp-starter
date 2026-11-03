@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use jiff::Timestamp;
 
-use super::{GrantStore, Granted, NewGrant, NewTokens, Registered, Rotation, TokenInfo};
+use super::{GrantStore, Granted, NewGrant, NewTokens, Registered, Rotation, Subject, TokenInfo};
 use crate::store::{
     Change, Client, Section, State as StoreState, Store, StoreError, Token, TokenKind,
 };
@@ -74,21 +74,45 @@ fn evict_client<S>(state: &mut StoreState<S>, keep: &str) -> bool {
     true
 }
 
+/// The owner is stored as an empty subject, so a single-owner state file never changes shape.
+fn stored_subject(subject: &Subject) -> (String, String) {
+    if *subject == Subject::owner() {
+        return (String::new(), String::new());
+    }
+
+    (subject.id.clone(), subject.name.clone())
+}
+
+fn token_subject(token: &Token) -> Subject {
+    if token.subject.is_empty() {
+        return Subject::owner();
+    }
+
+    Subject {
+        id: token.subject.clone(),
+        name: token.subject_name.clone(),
+    }
+}
+
+/// What the new tokens of a family have in common.
+struct Family<'a> {
+    id: &'a str,
+    client_id: &'a str,
+    scope: &'a str,
+    resource: &'a str,
+    subject: (String, String),
+}
+
 /// Adds an access and a refresh token to the family.
-fn issue<S>(
-    state: &mut StoreState<S>,
-    client_id: &str,
-    family: &str,
-    scope: &str,
-    resource: &str,
-    tokens: &NewTokens,
-) {
+fn issue<S>(state: &mut StoreState<S>, family: &Family, tokens: &NewTokens) {
     let record = |kind, expires_at| Token {
         kind,
-        client_id: client_id.to_string(),
-        family: family.to_string(),
-        scope: scope.to_string(),
-        resource: resource.to_string(),
+        client_id: family.client_id.to_string(),
+        family: family.id.to_string(),
+        scope: family.scope.to_string(),
+        resource: family.resource.to_string(),
+        subject: family.subject.0.clone(),
+        subject_name: family.subject.1.clone(),
         expires_at,
         rotated: false,
         extra: Default::default(),
@@ -161,10 +185,13 @@ impl<S: Section> GrantStore for Store<S> {
 
             issue(
                 state,
-                &grant.client_id,
-                &grant.family,
-                &grant.scope,
-                &grant.resource,
+                &Family {
+                    id: &grant.family,
+                    client_id: &grant.client_id,
+                    scope: &grant.scope,
+                    resource: &grant.resource,
+                    subject: stored_subject(&grant.subject),
+                },
                 &grant.tokens,
             );
             prune_tokens(state, now);
@@ -225,13 +252,16 @@ impl<S: Section> GrantStore for Store<S> {
                 return changed_if(pruned, Granted::Refused);
             }
 
-            let scope = match state.tokens.get_mut(hash) {
+            let (scope, subject) = match state.tokens.get_mut(hash) {
                 Some(record) => {
                     record.rotated = true;
 
-                    record.scope.clone()
+                    (
+                        record.scope.clone(),
+                        (record.subject.clone(), record.subject_name.clone()),
+                    )
                 }
-                None => String::new(),
+                None => (String::new(), (String::new(), String::new())),
             };
 
             if let Some(client) = state.clients.get_mut(client_id) {
@@ -240,10 +270,13 @@ impl<S: Section> GrantStore for Store<S> {
 
             issue(
                 state,
-                client_id,
-                &family,
-                &scope,
-                &rotation.resource,
+                &Family {
+                    id: &family,
+                    client_id,
+                    scope: &scope,
+                    resource: &rotation.resource,
+                    subject,
+                },
                 &rotation.tokens,
             );
             prune_tokens(state, now);
@@ -303,6 +336,7 @@ impl<S: Section> GrantStore for Store<S> {
                 && is_for_resource(&record.resource, &resource))
             .then(|| TokenInfo {
                 scope: record.scope.clone(),
+                subject: token_subject(record),
                 expires_at: record.expires_at,
             })
         })

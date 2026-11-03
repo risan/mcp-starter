@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use jiff::Timestamp;
 use mcp_starter::ServiceInfo;
-use mcp_starter::oauth::{OAuth, bcrypt_checker};
+use mcp_starter::oauth::{OAuth, Subject, bcrypt_checker};
 use mcp_starter::store::{Change, Section, Store, StoreOptions, TokenKind};
 use mcp_starter::test_support::TestClock;
 use mcp_starter::test_support::oauth_flow::{ISSUER, OAuthClient};
@@ -260,6 +260,7 @@ async fn go_fixture_token_verifies() {
     let info = oauth.verify("fixture-access-token-full").await.unwrap();
 
     assert_eq!(info.scope, "mfp");
+    assert_eq!(info.subject, Subject::owner());
     assert!(
         oauth.verify("fixture-refresh-token-full").await.is_err(),
         "a refresh token is not an access token"

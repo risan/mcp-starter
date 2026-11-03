@@ -149,6 +149,8 @@ fn token(kind: TokenKind, expires_at: &str, rotated: bool) -> Token {
         family: String::new(),
         scope: String::new(),
         resource: String::new(),
+        subject: String::new(),
+        subject_name: String::new(),
         expires_at: expires_at.parse().unwrap(),
         rotated,
         extra: Default::default(),

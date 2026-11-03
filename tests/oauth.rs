@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use jiff::SignedDuration;
-use mcp_starter::oauth::{revoke_all, set_password};
-use mcp_starter::store::{Change, Hooks, StoreOptions};
+use mcp_starter::oauth::{Subject, revoke_all, set_password};
+use mcp_starter::store::{Change, Hooks, StoreOptions, Token, TokenKind};
 use mcp_starter::test_support::oauth_flow::{
     CLAUDE_CALLBACK, ISSUER, OAuthRig, OWNER_PASSWORD, VERIFIER, authorize_params, pairs, pkce,
     set_param,
@@ -898,6 +898,79 @@ async fn refresh_rotation() {
         "invalid_grant",
         "the new refresh token is revoked too"
     );
+}
+
+#[tokio::test]
+async fn verify_returns_the_owner_subject() {
+    let rig = support::rig().await;
+    let (_, issued, _) = rig.client.full_flow().await;
+    let info = rig.oauth.verify(&issued.access_token).await.unwrap();
+
+    assert_eq!(info.subject, Subject::owner());
+    assert_eq!(info.subject.id, "owner");
+}
+
+#[tokio::test]
+async fn refresh_keeps_the_subject() {
+    let rig = support::rig().await;
+    let client_id = rig.client.register(&[CLAUDE_CALLBACK]).await;
+    let refresh_hash = sha256_hex("seeded-refresh-token");
+    let expires_at = "2099-01-01T00:00:00Z".parse().unwrap();
+
+    rig.store
+        .update(move |state| {
+            state.tokens.insert(
+                refresh_hash,
+                Token {
+                    kind: TokenKind::Refresh,
+                    client_id,
+                    family: "seeded-family".to_string(),
+                    scope: "example".to_string(),
+                    resource: String::new(),
+                    subject: "42".to_string(),
+                    subject_name: "Pat Jones".to_string(),
+                    expires_at,
+                    rotated: false,
+                    extra: Default::default(),
+                },
+            );
+
+            Change::Write(())
+        })
+        .await
+        .unwrap();
+
+    let client_id = rig.state().await.clients.keys().next().unwrap().clone();
+    let (reply, rotated) = rig.client.refresh(&client_id, "seeded-refresh-token").await;
+    let info = rig
+        .oauth
+        .verify(&rotated.unwrap().access_token)
+        .await
+        .unwrap_or_else(|error| panic!("refresh: {} {error}", reply.body));
+
+    assert_eq!(info.subject.id, "42");
+    assert_eq!(info.subject.name, "Pat Jones");
+}
+
+#[tokio::test]
+async fn no_subject_is_written_for_the_owner() {
+    let rig = support::rig().await;
+    let (client_id, issued, _) = rig.client.full_flow().await;
+
+    rig.client.refresh(&client_id, &issued.refresh_token).await;
+
+    let state = std::fs::read_to_string(rig.store.path()).unwrap();
+
+    assert!(!state.contains("subject"), "{state}");
+}
+
+fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 async fn set_token_resource(rig: &OAuthRig<TestState>, resource: &str) {

@@ -213,7 +213,7 @@ impl<St> Clone for BearerState<St> {
 async fn require_bearer<St: GrantStore>(
     State(state): State<BearerState<St>>,
     permit: ConnPermit,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let challenge = |with_error: bool| {
@@ -257,7 +257,11 @@ async fn require_bearer<St: GrantStore>(
     };
 
     match verified {
-        Ok(_) => next.run(request).await,
+        Ok(info) => {
+            request.extensions_mut().insert(info);
+
+            next.run(request).await
+        }
         Err(VerifyError::Invalid) => unauthorized(true, "invalid or expired token"),
         Err(VerifyError::Store(error)) => {
             eprintln!("bearer check: {error}");

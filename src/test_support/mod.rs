@@ -173,6 +173,8 @@ pub async fn store_bearer<S: Section>(store: &Store<S>, bearer: &str) {
                     family: "f".to_string(),
                     scope: String::new(),
                     resource: String::new(),
+                    subject: String::new(),
+                    subject_name: String::new(),
                     expires_at,
                     rotated: false,
                     extra: Default::default(),

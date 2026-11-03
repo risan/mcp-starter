@@ -14,7 +14,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use mcp_starter::server::{ServerOptions, buffer_body, serve};
-use mcp_starter::store::{Hooks, StoreOptions};
+use mcp_starter::store::{Change, Hooks, StoreOptions, Token, TokenKind};
 use mcp_starter::test_support::jsonrpc::McpClient;
 use mcp_starter::test_support::oauth_flow::{
     CLAUDE_CALLBACK, OWNER_PASSWORD, VERIFIER, authorize_params, set_param,
@@ -22,6 +22,7 @@ use mcp_starter::test_support::oauth_flow::{
 use mcp_starter::test_support::{raw_http, wait_until};
 use mcp_starter::work::Work;
 use serde_json::{Value, json};
+use sha2::Digest;
 use support::Setup;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -920,7 +921,7 @@ async fn end_to_end_tools_list() {
     let rig = support::start().await;
     let client = rig.mcp().await;
 
-    assert_eq!(client.list_tools().await.len(), 3);
+    assert_eq!(client.list_tools().await.len(), 4);
 }
 
 #[tokio::test]
@@ -936,9 +937,57 @@ async fn tools_list_marks_read_only() {
             .clone()
     };
 
+    assert_eq!(hint("example_whoami"), true);
     assert_eq!(hint("example_echo"), true);
     assert_eq!(hint("example_wait"), true);
     assert_eq!(hint("example_count"), false);
+}
+
+#[tokio::test]
+async fn the_bearer_check_hands_the_subject_to_the_tools() {
+    let rig = support::start().await;
+    let owner = rig.mcp().await.call("example_whoami", json!({})).await;
+
+    assert!(!owner.is_error, "{}", owner.text);
+    assert_eq!(owner.structured["subject"], "owner");
+
+    let hash: String = sha2::Sha256::digest(b"pat-bearer")
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    rig.store
+        .update(move |state| {
+            state.tokens.insert(
+                hash,
+                Token {
+                    kind: TokenKind::Access,
+                    client_id: "c".to_string(),
+                    family: "f".to_string(),
+                    scope: String::new(),
+                    resource: String::new(),
+                    subject: "42".to_string(),
+                    subject_name: "Pat Jones".to_string(),
+                    expires_at: "2099-01-01T00:00:00Z".parse().unwrap(),
+                    rotated: false,
+                    extra: Default::default(),
+                },
+            );
+
+            Change::Write(())
+        })
+        .await
+        .unwrap();
+
+    let pat = McpClient::new(&rig.url("/mcp")).with_bearer("pat-bearer");
+
+    pat.initialize().await;
+
+    let reply = pat.call("example_whoami", json!({})).await;
+
+    assert!(!reply.is_error, "{}", reply.text);
+    assert_eq!(reply.structured["subject"], "42");
+    assert_eq!(reply.structured["name"], "Pat Jones");
 }
 
 #[tokio::test]

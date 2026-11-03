@@ -17,6 +17,7 @@ use rmcp::{ErrorData, RoleServer};
 use serde_json::Value;
 
 use crate::config::Config;
+use crate::oauth::TokenInfo;
 use crate::work::{ConnPermit, Work};
 
 /// What a tool body returns: the summary line and the structured output, or the error text.
@@ -83,6 +84,16 @@ pub fn request_permit(context: &RequestContext<RoleServer>) -> ConnPermit {
         .and_then(|parts| parts.extensions.get::<ConnPermit>())
         .cloned()
         .unwrap_or_default()
+}
+
+/// What the bearer check verified for the request being served: the person and scope. Requests
+/// that do not come through the server's bearer check carry none.
+pub fn request_token(context: &RequestContext<RoleServer>) -> Option<TokenInfo> {
+    context
+        .extensions
+        .get::<Parts>()
+        .and_then(|parts| parts.extensions.get::<TokenInfo>())
+        .cloned()
 }
 
 /// Calls the tool the request names. Input that does not fit a tool's schema comes back as a

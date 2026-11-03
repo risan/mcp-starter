@@ -66,7 +66,7 @@ pieces).
 ## How a service uses it
 
 A complete service is in [`examples/minimal`](examples/minimal): `service.rs` holds the
-`ServiceInfo`, the section type, three tools and the command dispatch, and `main.rs` is three
+`ServiceInfo`, the section type, four tools and the command dispatch, and `main.rs` is three
 lines. `cargo test` compiles and runs it, and this crate's own tests drive it. In outline:
 
 ```rust,ignore

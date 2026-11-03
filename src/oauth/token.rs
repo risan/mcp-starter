@@ -212,6 +212,7 @@ impl<St: GrantStore> OAuth<St> {
             client_id: grant.client_id,
             scope: record.scope,
             resource: record.resource,
+            subject: record.subject,
             owner_hash: record.owner_hash,
             tokens: minted.stored.clone(),
         };

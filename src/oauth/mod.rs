@@ -1,6 +1,8 @@
-//! A minimal single-owner OAuth 2.1 authorization server: dynamic client registration, PKCE
-//! S256, a password consent page and rotating refresh tokens. Tokens and codes are opaque;
-//! only their SHA-256 is stored.
+//! A minimal OAuth 2.1 authorization server: dynamic client registration, PKCE S256, rotating
+//! refresh tokens and a sign-in that is either the owner's password on a consent page or an
+//! upstream service of the caller's ([`SignIn`]). Clients and grants live in a [`GrantStore`]:
+//! the state file for one owner, Postgres (feature `postgres`) for many people. Tokens and codes
+//! are opaque; only their SHA-256 is stored.
 
 mod authorize;
 #[cfg(feature = "postgres")]

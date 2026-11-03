@@ -1,6 +1,7 @@
-//! Building blocks for a single-owner MCP server: an OAuth 2.1 authorization server, a JSON
-//! state file with a cross-process lock, an HTTP server with strict deadlines, the CLI
-//! commands every such server needs and the helpers that run MCP tools as detached work.
+//! Building blocks for an MCP server: an OAuth 2.1 authorization server for one owner or for
+//! many people, a JSON state file with a cross-process lock or a Postgres store (feature
+//! `postgres`), an HTTP server with strict deadlines, the CLI commands every such server needs
+//! and the helpers that run MCP tools as detached work.
 //!
 //! This is not a framework. A service keeps its own `main`, command dispatch, tool handler
 //! and upstream client, and gives the blocks three things: a [`ServiceInfo`], its own
@@ -30,7 +31,7 @@
 //! |---|---|
 //! | [`config`] | the environment settings under the service's prefix |
 //! | [`store`] | the state file, [`store::Section`], the lease |
-//! | [`oauth`] | the authorization server and the owner-password commands' core |
+//! | [`oauth`] | the authorization server, its stores and sign-ins, and the owner-password commands' core |
 //! | [`server`] | the router, bearer check, body caps and the connection driver |
 //! | [`work`] | detached, tracked work and the connection slot |
 //! | [`http`] | the upstream client builder and bounded reads |

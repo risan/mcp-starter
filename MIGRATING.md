@@ -14,7 +14,7 @@ itself).
 | `mfp/mod.rs` `SessionLease` | `store::Lease` | `Lease::acquire(&store, &info)`. |
 | `mfp/mod.rs` `Clock`, `system_clock` | `mcp_starter::{Clock, system_clock}` | `crate::mfp::Clock` -> `mcp_starter::Clock`. |
 | `mfp/mod.rs` client builder, `describe`, `read_capped` | `http` | `client_builder(extra_root_pem)` has the D37 settings; `read_capped(response, limit)` takes the limit and returns a `String` error, so mfp wraps it into its own `CallError`. `MAX_RESPONSE_BYTES` is exported. |
-| `oauth/*` | `oauth` | `OAuth<S>::new(&'static info, store, issuer, clock, checker, work)`. The scope, display name (consent page) and command hint come from `ServiceInfo`; `OAuth::issuer` is new. |
+| `oauth/*` | `oauth` | `OAuth<Store<S>>::new(&'static info, store, issuer, clock, SignIn::Password(checker), work)`. The scope, display name (consent page) and command hint come from `ServiceInfo`; `OAuth::issuer` is new. |
 | `server.rs` | `server` | `mcp_service(public_url, tools_factory)`, `build_router(&info, oauth, work, mcp)` and `serve(work, ...)` take what `App` used to supply. The favicon bytes and the protected-resource scope come from `ServiceInfo`. |
 | `app.rs` | `work` | `Work`, `ConnPermit`, `ShuttingDown` move. `App` stays in mfp as a service-owned struct holding `Work`, `Config`, the MFP client and the tool options; `App::spawn_work` is `Work::spawn`. The `water` lock stays in `App`. |
 | `cli.rs` | `cli` | `Io`, `Getenv`, `Outcome`, `read_secret`, `set_password`, `revoke_tokens`, `shutdown_on_signals`, `Serving` (store check, lease, `Work`, `OAuth`, bind, shutdown token, the listening line, `serve`) and `oauth_status` (the three generic `status` lines). The command dispatch (`cli::run`) stays in mfp and calls these blocks. |

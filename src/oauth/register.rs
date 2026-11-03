@@ -11,6 +11,7 @@ use crate::store::Client;
 use crate::work::ConnPermit;
 
 pub(super) const CLAUDE_CALLBACK: &str = "https://claude.ai/api/mcp/auth_callback";
+const CLAUDE_COM_CALLBACK: &str = "https://claude.com/api/mcp/auth_callback";
 // ChatGPT uses the stable callback or, for an authorization server without RFC 9207 issuer
 // identification, one with a per-connector id
 // (https://developers.openai.com/apps-sdk/build/auth).
@@ -143,6 +144,7 @@ pub(super) fn parse_loopback(raw: &str) -> Option<Url> {
 
 fn allowed_redirect(raw: &str) -> bool {
     raw == CLAUDE_CALLBACK
+        || raw == CLAUDE_COM_CALLBACK
         || raw == CHATGPT_CALLBACK
         || is_chatgpt_connector_callback(raw)
         || parse_loopback(raw).is_some()

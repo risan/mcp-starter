@@ -65,6 +65,7 @@ async fn register() {
 
     for redirect in [
         CLAUDE_CALLBACK,
+        CLAUDE_COM_CALLBACK,
         "https://chatgpt.com/connector_platform_oauth_redirect",
         "https://chatgpt.com/connector/oauth/AbC-12_xyz",
         "http://127.0.0.1:5555/callback",
@@ -91,6 +92,9 @@ async fn register() {
     for bad in [
         "https://evil.example/cb",
         "http://claude.ai/api/mcp/auth_callback",
+        "http://claude.com/api/mcp/auth_callback",
+        "https://claude.com/api/mcp/auth_callback/x",
+        "https://www.claude.com/api/mcp/auth_callback",
         "http://evil.example:5555/cb",
         "https://claude.ai/api/mcp/auth_callback/extra",
         "http://127.0.0.1.evil.example:80/cb",
@@ -351,6 +355,35 @@ async fn authorize_consent_page() {
         "{}",
         reply.header("content-security-policy")
     );
+}
+
+const CLAUDE_COM_CALLBACK: &str = "https://claude.com/api/mcp/auth_callback";
+
+#[tokio::test]
+async fn the_claude_com_callback_completes_the_flow() {
+    let rig = support::rig().await;
+    let client_id = rig.client.register(&[CLAUDE_COM_CALLBACK]).await;
+    let (form, reply) = rig
+        .client
+        .consent(&authorize_params(&INFO, &client_id, CLAUDE_COM_CALLBACK))
+        .await;
+
+    assert!(reply.body.contains(CLAUDE_COM_CALLBACK), "{}", reply.body);
+
+    let approved = rig.client.approve(&form.unwrap(), OWNER_PASSWORD).await;
+
+    assert_eq!(approved.status, 303, "{}", approved.body);
+    assert!(approved.header("location").starts_with(CLAUDE_COM_CALLBACK));
+    assert_eq!(approved.location_param("iss").as_deref(), Some(ISSUER));
+
+    let code = approved.location_param("code").unwrap();
+    let (reply, issued) = rig
+        .client
+        .exchange(&client_id, CLAUDE_COM_CALLBACK, &code, VERIFIER)
+        .await;
+
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(issued.is_some());
 }
 
 #[tokio::test]

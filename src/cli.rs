@@ -164,7 +164,7 @@ pub struct Serving<S> {
     /// The detached work the server tracks.
     pub work: Arc<Work>,
     /// The OAuth server.
-    pub oauth: OAuth<S>,
+    pub oauth: OAuth<Store<S>>,
     /// Cancelled to start the shutdown sequence.
     pub shutdown: CancellationToken,
     info: &'static ServiceInfo,

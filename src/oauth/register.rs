@@ -6,8 +6,8 @@ use reqwest::Url;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{MAX_CLIENTS, OAuth, OAuthError, json_response, prune_tokens, random_token};
-use crate::store::{Change, Client, Section, State as StoreState};
+use super::{GrantStore, OAuth, OAuthError, Registered, json_response, random_token};
+use crate::store::Client;
 use crate::work::ConnPermit;
 
 pub(super) const CLAUDE_CALLBACK: &str = "https://claude.ai/api/mcp/auth_callback";
@@ -25,8 +25,8 @@ struct Registration {
     token_endpoint_auth_method: Option<String>,
 }
 
-pub(super) async fn register<S: Section>(
-    State(oauth): State<OAuth<S>>,
+pub(super) async fn register<St: GrantStore>(
+    State(oauth): State<OAuth<St>>,
     permit: ConnPermit,
     body: Bytes,
 ) -> Response {
@@ -41,7 +41,7 @@ pub(super) async fn register<S: Section>(
     }
 }
 
-async fn register_client<S: Section>(oauth: OAuth<S>, body: Bytes) -> Response {
+async fn register_client<St: GrantStore>(oauth: OAuth<St>, body: Bytes) -> Response {
     let Ok(request) = serde_json::from_slice::<Registration>(&body) else {
         return OAuthError::bad_request(
             "invalid_client_metadata",
@@ -91,29 +91,20 @@ async fn register_client<S: Section>(oauth: OAuth<S>, body: Bytes) -> Response {
         last_used_at: None,
         extra: Default::default(),
     };
-    let stored = client.clone();
-    let saved = oauth
-        .inner
-        .store
-        .update(move |state| {
-            let keep = stored.client_id.clone();
+    let saved = oauth.inner.store.register_client(client.clone(), now).await;
 
-            state.clients.insert(keep.clone(), stored);
+    match saved {
+        Ok(Registered::Accepted) => {}
+        Ok(Registered::Full) => {
+            eprintln!("register: too many registered clients");
 
-            while state.clients.len() > MAX_CLIENTS {
-                if !evict_client(state, &keep) {
-                    break;
-                }
-            }
-
-            prune_tokens(state, now);
-
-            Change::Write(())
-        })
-        .await;
-
-    if saved.is_err() {
-        return OAuthError::internal().into_response();
+            return OAuthError::bad_request(
+                "invalid_client_metadata",
+                "too many registered clients",
+            )
+            .into_response();
+        }
+        Err(_) => return OAuthError::internal().into_response(),
     }
 
     json_response(
@@ -128,33 +119,6 @@ async fn register_client<S: Section>(oauth: OAuth<S>, body: Bytes) -> Response {
             "client_name": client.client_name,
         }),
     )
-}
-
-/// Removes the client unused for longest: never-used clients first, oldest
-/// registration first; otherwise the oldest grant. `keep` is spared. Returns whether a
-/// client was removed.
-fn evict_client<S>(state: &mut StoreState<S>, keep: &str) -> bool {
-    let victim = state
-        .clients
-        .values()
-        .filter(|client| client.client_id != keep)
-        .min_by_key(|client| {
-            (
-                client.last_used_at.is_some(),
-                client.last_used_at,
-                client.registered_at,
-            )
-        })
-        .map(|client| client.client_id.clone());
-
-    let Some(victim) = victim else {
-        return false;
-    };
-
-    state.clients.remove(&victim);
-    state.tokens.retain(|_, token| token.client_id != victim);
-
-    true
 }
 
 fn truncate(text: &str, limit: usize) -> String {

@@ -9,10 +9,10 @@ use std::collections::HashMap;
 
 use super::register::{parse_loopback, redirect_matches};
 use super::{
-    CODE_TTL, CSRF_TTL, CodeRecord, CsrfRecord, LOCKOUT_FAILS, LOCKOUT_WINDOW, OAuth,
+    CODE_TTL, CSRF_TTL, CodeRecord, CsrfRecord, GrantStore, LOCKOUT_FAILS, LOCKOUT_WINDOW, OAuth,
     OFFLINE_ACCESS, hash_token, insert_bounded, parse_pairs, random_token,
 };
-use crate::store::{Client, Section};
+use crate::store::Client;
 use crate::work::ConnPermit;
 
 /// The parameters the consent page carries from `GET /authorize` to `POST /authorize`.
@@ -150,16 +150,11 @@ fn error_page(status: StatusCode, message: &str) -> Response {
     )
 }
 
-impl<S: Section> OAuth<S> {
+impl<St: GrantStore> OAuth<St> {
     async fn find_client(&self, id: &str) -> Option<Client> {
         let id = id.to_string();
 
-        self.inner
-            .store
-            .read(move |state| state.clients.get(&id).cloned())
-            .await
-            .ok()
-            .flatten()
+        self.inner.store.find_client(&id).await.ok().flatten()
     }
 
     /// Checks the client and redirect URI. A failure never redirects.
@@ -437,8 +432,8 @@ fn granted_scope(service_scope: &str, requested: &str) -> String {
     granted.join(" ")
 }
 
-pub(super) async fn authorize_get<S: Section>(
-    State(oauth): State<OAuth<S>>,
+pub(super) async fn authorize_get<St: GrantStore>(
+    State(oauth): State<OAuth<St>>,
     permit: ConnPermit,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
@@ -452,7 +447,10 @@ pub(super) async fn authorize_get<S: Section>(
     }
 }
 
-async fn show_consent<S: Section>(oauth: OAuth<S>, query: HashMap<String, String>) -> Response {
+async fn show_consent<St: GrantStore>(
+    oauth: OAuth<St>,
+    query: HashMap<String, String>,
+) -> Response {
     let request = AuthRequest::from_fields(&query);
     let client = match oauth.validate_target(&request).await {
         Ok(client) => client,
@@ -482,8 +480,8 @@ async fn show_consent<S: Section>(oauth: OAuth<S>, query: HashMap<String, String
     oauth.consent_page(StatusCode::OK, &request, &client, "", true)
 }
 
-pub(super) async fn authorize_post<S: Section>(
-    State(oauth): State<OAuth<S>>,
+pub(super) async fn authorize_post<St: GrantStore>(
+    State(oauth): State<OAuth<St>>,
     permit: ConnPermit,
     body: Bytes,
 ) -> Response {
@@ -497,7 +495,7 @@ pub(super) async fn authorize_post<S: Section>(
     }
 }
 
-async fn approve<S: Section>(oauth: OAuth<S>, body: Bytes) -> Response {
+async fn approve<St: GrantStore>(oauth: OAuth<St>, body: Bytes) -> Response {
     let fields = parse_pairs(&body);
     let request = AuthRequest::from_fields(&fields);
 
@@ -524,7 +522,7 @@ async fn approve<S: Section>(oauth: OAuth<S>, body: Bytes) -> Response {
     let hash = oauth
         .inner
         .store
-        .read(|state| state.owner.password_hash.clone())
+        .owner_password_hash()
         .await
         .unwrap_or_default();
 
@@ -566,7 +564,11 @@ async fn approve<S: Section>(oauth: OAuth<S>, body: Bytes) -> Response {
     }
 }
 
-fn grant_redirect<S: Section>(oauth: &OAuth<S>, request: &AuthRequest, code: &str) -> Response {
+fn grant_redirect<St: GrantStore>(
+    oauth: &OAuth<St>,
+    request: &AuthRequest,
+    code: &str,
+) -> Response {
     let Ok(mut target) = Url::parse(&request.redirect_uri) else {
         return error_page(
             StatusCode::BAD_REQUEST,

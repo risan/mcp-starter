@@ -231,7 +231,7 @@ static MFP_INFO: ServiceInfo = ServiceInfo {
 /// The public URL the fixture's tokens were issued under (resource `{FIXTURE_ISSUER}/mcp`).
 const FIXTURE_ISSUER: &str = "https://mfp.example.com";
 
-fn mfp_oauth(store: &Store<MfpSection>, issuer: &str) -> OAuth<MfpSection> {
+fn mfp_oauth(store: &Store<MfpSection>, issuer: &str) -> OAuth<Store<MfpSection>> {
     let clock = TestClock::new("2026-10-24T09:00:00Z");
 
     OAuth::new(

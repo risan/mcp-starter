@@ -451,7 +451,7 @@ pub struct OAuthRig<S> {
     /// The clock the server reads.
     pub clock: TestClock,
     /// The server under test.
-    pub oauth: OAuth<S>,
+    pub oauth: OAuth<Store<S>>,
     /// A client for the server's routes.
     pub client: OAuthClient,
     /// Counts and gates password checks.
@@ -507,7 +507,7 @@ impl<S: Section> OAuthRig<S> {
         clock: &TestClock,
         probe: &Arc<Probe>,
         work: &Arc<Work>,
-    ) -> (OAuth<S>, OAuthClient, JoinHandle<()>) {
+    ) -> (OAuth<Store<S>>, OAuthClient, JoinHandle<()>) {
         let oauth = OAuth::new(
             info,
             store.clone(),

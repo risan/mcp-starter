@@ -4,10 +4,12 @@
 
 mod authorize;
 mod register;
+mod state_file;
 mod token;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
@@ -21,7 +23,7 @@ use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::store::{Change, Section, State as StoreState, Store, StoreError, TokenKind};
+use crate::store::{Change, Client, Section, Store, StoreError};
 use crate::work::{ShuttingDown, Work};
 use crate::{Clock, ServiceInfo};
 
@@ -29,7 +31,6 @@ const ACCESS_TTL: SignedDuration = SignedDuration::from_hours(24);
 const REFRESH_TTL: SignedDuration = SignedDuration::from_hours(60 * 24);
 const CODE_TTL: SignedDuration = SignedDuration::from_mins(5);
 const CSRF_TTL: SignedDuration = SignedDuration::from_mins(10);
-const MAX_CLIENTS: usize = 50;
 const MAX_PENDING: usize = 100;
 const BODY_LIMIT: usize = 64 << 10;
 const LOCKOUT_FAILS: usize = 5;
@@ -73,6 +74,129 @@ impl fmt::Display for VerifyError {
 }
 
 impl std::error::Error for VerifyError {}
+
+/// The hashes and expiry times of a new access and refresh token. The store never sees the
+/// raw tokens.
+#[derive(Debug, Clone)]
+pub struct NewTokens {
+    /// Lowercase hex SHA-256 of the access token.
+    pub access_hash: String,
+    /// Lowercase hex SHA-256 of the refresh token.
+    pub refresh_hash: String,
+    /// When the access token stops working.
+    pub access_expires_at: Timestamp,
+    /// When the refresh token stops working.
+    pub refresh_expires_at: Timestamp,
+}
+
+/// An authorization code that is about to become a grant: a family and its first token pair.
+#[derive(Debug, Clone)]
+pub struct NewGrant {
+    /// Lowercase hex SHA-256 of the code; the id of the family the grant starts.
+    pub family: String,
+    /// The client the code was issued to.
+    pub client_id: String,
+    /// The granted scope.
+    pub scope: String,
+    /// The MCP resource URL the tokens are bound to.
+    pub resource: String,
+    /// The owner password hash the approval was checked against; the grant is refused when
+    /// the owner password has changed since.
+    pub owner_hash: String,
+    /// The first token pair.
+    pub tokens: NewTokens,
+}
+
+/// A refresh token that is about to be exchanged for a new pair.
+#[derive(Debug, Clone)]
+pub struct Rotation {
+    /// Lowercase hex SHA-256 of the refresh token the client presented.
+    pub presented_hash: String,
+    /// The client that presented it.
+    pub client_id: String,
+    /// The resource of this server; a token issued for another one is refused.
+    pub resource: String,
+    /// The new token pair.
+    pub tokens: NewTokens,
+}
+
+/// What a store decided about a code exchange or a refresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Granted<T> {
+    /// The new tokens were stored.
+    Issued(T),
+    /// The grant is invalid, expired or already used. Whatever the attempt revoked is revoked.
+    Refused,
+}
+
+/// What a store decided about a new client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registered {
+    /// The client was stored.
+    Accepted,
+    /// The store holds as many clients as it allows and could not make room.
+    Full,
+}
+
+/// Where the authorization server keeps its clients and grants. The state file implements
+/// it for a single owner; every method is one atomic decision, so a store can sit on a
+/// database as well as on a file.
+///
+/// Implementors write `async fn`; the declarations spell out the `Send` bound a router needs.
+pub trait GrantStore: Send + Sync + 'static {
+    /// The registered client with this id.
+    fn find_client(
+        &self,
+        id: &str,
+    ) -> impl Future<Output = Result<Option<Client>, StoreError>> + Send;
+
+    /// Stores a new client, making room first when the store is full.
+    fn register_client(
+        &self,
+        client: Client,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<Registered, StoreError>> + Send;
+
+    /// Turns an approved code into a grant. Refused when the client is gone.
+    fn exchange_code(
+        &self,
+        grant: NewGrant,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<Granted<()>, StoreError>> + Send;
+
+    /// Exchanges a refresh token for a new pair. Presenting a rotated token revokes its
+    /// family and still answers [`Granted::Refused`]. On success it returns the scope.
+    fn rotate_refresh(
+        &self,
+        rotation: Rotation,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<Granted<String>, StoreError>> + Send;
+
+    /// Deletes every token of a family.
+    fn revoke_family(
+        &self,
+        family: &str,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Revokes by token: a refresh token takes its family, an access token only itself.
+    fn revoke_token(
+        &self,
+        token_hash: &str,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// What a live access token for `resource` grants; `None` for anything else.
+    fn verify(
+        &self,
+        token_hash: &str,
+        resource: &str,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<Option<TokenInfo>, StoreError>> + Send;
+
+    /// The bcrypt hash of the owner password; empty when none is set.
+    fn owner_password_hash(&self) -> impl Future<Output = Result<String, StoreError>> + Send;
+}
 
 /// A pending CSRF token or authorization code, held in memory only.
 trait Pending {
@@ -153,8 +277,8 @@ struct PendingState {
     locked_until: Option<Timestamp>,
 }
 
-struct Inner<S> {
-    store: Store<S>,
+struct Inner<St> {
+    store: St,
     info: &'static ServiceInfo,
     issuer: String,
     resource: String,
@@ -168,30 +292,31 @@ struct Inner<S> {
     grant_lock: tokio::sync::Mutex<()>,
 }
 
-/// The authorization server for one service, over its state file.
-pub struct OAuth<S> {
-    inner: Arc<Inner<S>>,
+/// The authorization server for one service, over a [`GrantStore`]. For the state file,
+/// `OAuth<Store<S>>`.
+pub struct OAuth<St> {
+    inner: Arc<Inner<St>>,
 }
 
-impl<S> Clone for OAuth<S> {
-    fn clone(&self) -> OAuth<S> {
+impl<St> Clone for OAuth<St> {
+    fn clone(&self) -> OAuth<St> {
         OAuth {
             inner: self.inner.clone(),
         }
     }
 }
 
-impl<S: Section> OAuth<S> {
+impl<St: GrantStore> OAuth<St> {
     /// `issuer` is the public https origin; the protected resource is `issuer/mcp`. The
     /// service's scope, display name and command come from `info`.
     pub fn new(
         info: &'static ServiceInfo,
-        store: Store<S>,
+        store: St,
         issuer: &str,
         clock: Clock,
         checker: PasswordChecker,
         work: Arc<Work>,
-    ) -> OAuth<S> {
+    ) -> OAuth<St> {
         OAuth {
             inner: Arc::new(Inner {
                 store,
@@ -214,15 +339,15 @@ impl<S: Section> OAuth<S> {
         Router::new()
             .route(
                 "/.well-known/oauth-authorization-server",
-                get(metadata::<S>),
+                get(metadata::<St>),
             )
-            .route("/register", post(register::register::<S>))
+            .route("/register", post(register::register::<St>))
             .route(
                 "/authorize",
-                get(authorize::authorize_get::<S>).post(authorize::authorize_post::<S>),
+                get(authorize::authorize_get::<St>).post(authorize::authorize_post::<St>),
             )
-            .route("/token", post(token::token::<S>))
-            .route("/revoke", post(token::revoke::<S>))
+            .route("/token", post(token::token::<St>))
+            .route("/revoke", post(token::revoke::<St>))
             .layer(DefaultBodyLimit::max(BODY_LIMIT))
             .with_state(self.clone())
     }
@@ -247,35 +372,19 @@ impl<S: Section> OAuth<S> {
         (pending.csrf.len(), pending.codes.len())
     }
 
-    /// Checks a bearer access token against `state.json`. A token issued for another
-    /// resource (the state file of a server at another public URL) is refused.
+    /// Checks a bearer access token against the store. A token issued for another resource
+    /// (the state file of a server at another public URL) is refused.
     pub async fn verify(&self, raw_token: &str) -> Result<TokenInfo, VerifyError> {
-        let hash = hash_token(raw_token);
-        let now = self.now();
-        let resource = self.inner.resource.clone();
-        let info = self
-            .inner
+        self.inner
             .store
-            .read(move |state| {
-                let record = state.tokens.get(&hash)?;
-
-                (record.kind == TokenKind::Access
-                    && !record.rotated
-                    && now < record.expires_at
-                    && is_for_resource(&record.resource, &resource))
-                .then(|| TokenInfo {
-                    scope: record.scope.clone(),
-                    expires_at: record.expires_at,
-                })
-            })
+            .verify(&hash_token(raw_token), &self.inner.resource, self.now())
             .await
-            .map_err(VerifyError::Store)?;
-
-        info.ok_or(VerifyError::Invalid)
+            .map_err(VerifyError::Store)?
+            .ok_or(VerifyError::Invalid)
     }
 }
 
-async fn metadata<S: Section>(State(oauth): State<OAuth<S>>) -> Response {
+async fn metadata<St: GrantStore>(State(oauth): State<OAuth<St>>) -> Response {
     let issuer = &oauth.inner.issuer;
 
     json_response(
@@ -321,42 +430,6 @@ pub async fn revoke_all<S: Section>(store: &Store<S>) -> Result<(), StoreError> 
             Change::Write(())
         })
         .await
-}
-
-/// Drops expired tokens. A rotated refresh record stays only while its family still has a
-/// live token, so replaying it keeps revoking the descendants; a family with nothing live
-/// is removed whole. Returns whether anything was removed.
-fn prune_tokens<S>(state: &mut StoreState<S>, now: Timestamp) -> bool {
-    let live: BTreeSet<String> = state
-        .tokens
-        .values()
-        .filter(|token| !token.rotated && now < token.expires_at)
-        .map(|token| token.family.clone())
-        .collect();
-    let before = state.tokens.len();
-
-    state.tokens.retain(|_, token| {
-        if token.rotated {
-            live.contains(&token.family)
-        } else {
-            now < token.expires_at
-        }
-    });
-
-    state.tokens.len() != before
-}
-
-/// Records written before tokens carried a resource have none; they stay valid.
-fn is_for_resource(record_resource: &str, resource: &str) -> bool {
-    record_resource.is_empty() || record_resource == resource
-}
-
-fn delete_family<S>(state: &mut StoreState<S>, family: &str) -> bool {
-    let before = state.tokens.len();
-
-    state.tokens.retain(|_, token| token.family != family);
-
-    state.tokens.len() != before
 }
 
 fn random_token(bytes: usize) -> String {

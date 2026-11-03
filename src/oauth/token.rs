@@ -9,10 +9,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use super::{
-    ACCESS_TTL, CodeRecord, OAuth, OAuthError, REFRESH_TTL, delete_family, hash_token,
-    is_for_resource, json_response, parse_pairs, prune_tokens, random_token,
+    ACCESS_TTL, CodeRecord, GrantStore, Granted, NewGrant, NewTokens, OAuth, OAuthError,
+    REFRESH_TTL, Rotation, hash_token, json_response, parse_pairs, random_token,
 };
-use crate::store::{Change, Section, State as StoreState, Token, TokenKind};
 use crate::work::ConnPermit;
 
 struct TokenResponse {
@@ -53,8 +52,8 @@ fn is_form(headers: &HeaderMap) -> bool {
         })
 }
 
-pub(super) async fn token<S: Section>(
-    State(oauth): State<OAuth<S>>,
+pub(super) async fn token<St: GrantStore>(
+    State(oauth): State<OAuth<St>>,
     permit: ConnPermit,
     headers: HeaderMap,
     body: Bytes,
@@ -68,7 +67,7 @@ pub(super) async fn token<S: Section>(
     }
 }
 
-async fn grant<S: Section>(oauth: OAuth<S>, is_form: bool, body: Bytes) -> Response {
+async fn grant<St: GrantStore>(oauth: OAuth<St>, is_form: bool, body: Bytes) -> Response {
     if !is_form {
         return OAuthError::bad_request(
             "invalid_request",
@@ -130,44 +129,40 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
             == 0
 }
 
-/// Adds an access and a refresh token to the family and returns the raw values.
-fn issue<S>(
-    state: &mut StoreState<S>,
-    now: Timestamp,
-    client_id: &str,
-    family: &str,
-    scope: &str,
-    resource: &str,
-) -> TokenResponse {
-    let (access, refresh) = (random_token(32), random_token(32));
-    let record = |kind, expires_at| Token {
-        kind,
-        client_id: client_id.to_string(),
-        family: family.to_string(),
-        scope: scope.to_string(),
-        resource: resource.to_string(),
-        expires_at,
-        rotated: false,
-        extra: Default::default(),
-    };
+/// A fresh token pair: the raw values for the client and the hashes for the store.
+struct Minted {
+    access: String,
+    refresh: String,
+    stored: NewTokens,
+}
 
-    state.tokens.insert(
-        hash_token(&access),
-        record(TokenKind::Access, now + ACCESS_TTL),
-    );
-    state.tokens.insert(
-        hash_token(&refresh),
-        record(TokenKind::Refresh, now + REFRESH_TTL),
-    );
+impl Minted {
+    fn new(now: Timestamp) -> Minted {
+        let (access, refresh) = (random_token(32), random_token(32));
+        let stored = NewTokens {
+            access_hash: hash_token(&access),
+            refresh_hash: hash_token(&refresh),
+            access_expires_at: now + ACCESS_TTL,
+            refresh_expires_at: now + REFRESH_TTL,
+        };
 
-    TokenResponse {
-        access_token: access,
-        refresh_token: refresh,
-        scope: scope.to_string(),
+        Minted {
+            access,
+            refresh,
+            stored,
+        }
+    }
+
+    fn response(self, scope: String) -> TokenResponse {
+        TokenResponse {
+            access_token: self.access,
+            refresh_token: self.refresh,
+            scope,
+        }
     }
 }
 
-impl<S: Section> OAuth<S> {
+impl<St: GrantStore> OAuth<St> {
     /// Exchanges an authorization code. It runs as detached work under one lock held from the
     /// code lookup through the store commit that issues the tokens, so a concurrent
     /// replay waits, then finds the family in `state.json` and revokes it. The commit also
@@ -210,55 +205,26 @@ impl<S: Section> OAuth<S> {
             ));
         }
 
-        let client_id = grant.client_id;
-        let outcome = self
-            .inner
-            .store
-            .update(move |state| {
-                if state.owner.password_hash != record.owner_hash {
-                    return Change::Unchanged(Err(OAuthError::invalid_grant()));
-                }
+        let minted = Minted::new(now);
+        let scope = record.scope.clone();
+        let new_grant = NewGrant {
+            family: code_hash,
+            client_id: grant.client_id,
+            scope: record.scope,
+            resource: record.resource,
+            owner_hash: record.owner_hash,
+            tokens: minted.stored.clone(),
+        };
 
-                let Some(client) = state.clients.get_mut(&client_id) else {
-                    return Change::Unchanged(Err(OAuthError::invalid_grant()));
-                };
-
-                client.last_used_at = Some(now);
-
-                let response = issue(
-                    state,
-                    now,
-                    &client_id,
-                    &code_hash,
-                    &record.scope,
-                    &record.resource,
-                );
-
-                prune_tokens(state, now);
-
-                Change::Write(Ok(response))
-            })
-            .await;
-
-        outcome.unwrap_or_else(|_| Err(OAuthError::internal()))
+        match self.inner.store.exchange_code(new_grant, now).await {
+            Ok(Granted::Issued(())) => Ok(minted.response(scope)),
+            Ok(Granted::Refused) => Err(OAuthError::invalid_grant()),
+            Err(_) => Err(OAuthError::internal()),
+        }
     }
 
     async fn revoke_family(&self, family: String) -> Result<(), crate::store::StoreError> {
-        let now = self.now();
-
-        self.inner
-            .store
-            .update(move |state| {
-                let removed = delete_family(state, &family);
-                let pruned = prune_tokens(state, now);
-
-                if removed || pruned {
-                    Change::Write(())
-                } else {
-                    Change::Unchanged(())
-                }
-            })
-            .await
+        self.inner.store.revoke_family(&family, self.now()).await
     }
 
     /// Rotates a refresh token: one store transaction with a fresh read. Presenting an
@@ -277,91 +243,25 @@ impl<S: Section> OAuth<S> {
             ));
         }
 
-        let hash = hash_token(&refresh_token);
         let now = self.now();
-        let expected_resource = self.inner.resource.clone();
-        let outcome = self
-            .inner
-            .store
-            .update(move |state| {
-                let (record_kind, rotated, family, record_client, expires_at, record_resource) =
-                    match state.tokens.get(&hash) {
-                        Some(record) => (
-                            Some(record.kind),
-                            record.rotated,
-                            record.family.clone(),
-                            record.client_id.clone(),
-                            record.expires_at,
-                            record.resource.clone(),
-                        ),
-                        None => (
-                            None,
-                            false,
-                            String::new(),
-                            String::new(),
-                            now,
-                            String::new(),
-                        ),
-                    };
+        let minted = Minted::new(now);
+        let rotation = Rotation {
+            presented_hash: hash_token(&refresh_token),
+            client_id,
+            resource: self.inner.resource.clone(),
+            tokens: minted.stored.clone(),
+        };
 
-                if record_kind != Some(TokenKind::Refresh) {
-                    let pruned = prune_tokens(state, now);
-
-                    return changed_if(pruned, Err(OAuthError::invalid_grant()));
-                }
-
-                if rotated {
-                    delete_family(state, &family);
-                    prune_tokens(state, now);
-
-                    return Change::Write(Err(OAuthError::invalid_grant()));
-                }
-
-                if record_client != client_id
-                    || !state.clients.contains_key(&client_id)
-                    || now >= expires_at
-                    || !is_for_resource(&record_resource, &expected_resource)
-                {
-                    let pruned = prune_tokens(state, now);
-
-                    return changed_if(pruned, Err(OAuthError::invalid_grant()));
-                }
-
-                let scope = match state.tokens.get_mut(&hash) {
-                    Some(record) => {
-                        record.rotated = true;
-
-                        record.scope.clone()
-                    }
-                    None => String::new(),
-                };
-
-                if let Some(client) = state.clients.get_mut(&client_id) {
-                    client.last_used_at = Some(now);
-                }
-
-                let response = issue(state, now, &client_id, &family, &scope, &expected_resource);
-
-                prune_tokens(state, now);
-
-                Change::Write(Ok(response))
-            })
-            .await;
-
-        outcome.unwrap_or_else(|_| Err(OAuthError::internal()))
+        match self.inner.store.rotate_refresh(rotation, now).await {
+            Ok(Granted::Issued(scope)) => Ok(minted.response(scope)),
+            Ok(Granted::Refused) => Err(OAuthError::invalid_grant()),
+            Err(_) => Err(OAuthError::internal()),
+        }
     }
 }
 
-fn changed_if<T>(changed: bool, value: T) -> Change<T> {
-    if changed {
-        Change::Write(value)
-    } else {
-        Change::Unchanged(value)
-    }
-}
-
-pub(super) async fn revoke<S: Section>(
-    State(oauth): State<OAuth<S>>,
+pub(super) async fn revoke<St: GrantStore>(
+    State(oauth): State<OAuth<St>>,
     permit: ConnPermit,
     body: Bytes,
 ) -> Response {
@@ -373,28 +273,10 @@ pub(super) async fn revoke<S: Section>(
     }
 }
 
-async fn revoke_token<S: Section>(oauth: OAuth<S>, body: Bytes) -> Response {
+async fn revoke_token<St: GrantStore>(oauth: OAuth<St>, body: Bytes) -> Response {
     let form = parse_pairs(&body);
     let hash = hash_token(form.get("token").map_or("", String::as_str));
-    let now = oauth.now();
-    let saved = oauth
-        .inner
-        .store
-        .update(move |state| {
-            let removed = match state
-                .tokens
-                .get(&hash)
-                .map(|record| (record.kind, record.family.clone()))
-            {
-                None => false,
-                Some((TokenKind::Refresh, family)) => delete_family(state, &family),
-                Some((TokenKind::Access, _)) => state.tokens.remove(&hash).is_some(),
-            };
-            let pruned = prune_tokens(state, now);
-
-            changed_if(removed || pruned, ())
-        })
-        .await;
+    let saved = oauth.inner.store.revoke_token(&hash, oauth.now()).await;
 
     if saved.is_err() {
         return OAuthError::internal().into_response();

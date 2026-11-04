@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 use rustls::RootCertStore;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio_postgres::Client as Database;
 use tokio_postgres::config::SslMode;
 use tokio_postgres::error::SqlState;
@@ -39,6 +39,8 @@ const MAX_CLIENTS: i64 = 1000;
 const UNUSED_CLIENT_AGE_SECONDS: i64 = 24 * 60 * 60;
 const PRUNE_AFTER_SECONDS: i64 = 60 * 60;
 const PRUNE_BATCH: i64 = 500;
+/// The prune is optional work after a committed grant: it must not hold the token reply back.
+const PRUNE_DEADLINE: Duration = Duration::from_secs(2);
 
 /// A client and the task that drives its socket. Dropping it aborts the task, which closes the
 /// socket at once.
@@ -66,12 +68,16 @@ struct Inner {
 
 impl PgStore {
     /// Removes some families that expired over an hour ago, a batch at a time, with a permit
-    /// and a deadline of its own. A family another operation holds locked is left for the next
-    /// prune, so this never waits on a lock.
+    /// and a deadline of its own. It takes a permit only when one is free, and a family another
+    /// operation holds locked is left for the next prune, so it never waits for either.
     async fn prune_families(&self, now: Timestamp) -> Result<(), StoreError> {
         let cutoff = now.as_second() - PRUNE_AFTER_SECONDS;
+        let Ok(permit) = self.inner.permits.try_acquire() else {
+            return Ok(());
+        };
+        let deadline = PRUNE_DEADLINE.min(self.inner.deadline);
 
-        self.run(async |database| {
+        self.execute(permit, deadline, async |database| {
             database
                 .execute_typed(
                     "delete from oauth_families
@@ -155,6 +161,12 @@ impl PgStore {
             .insert(super::hash_token(token), info);
     }
 
+    /// Takes one permit and keeps it until the guard drops, so a test can fill the store.
+    #[cfg(feature = "test-support")]
+    pub async fn hold_permit(&self) -> SemaphorePermit<'_> {
+        self.inner.permits.acquire().await.unwrap()
+    }
+
     async fn connect(&self) -> Result<Connection, tokio_postgres::Error> {
         let (client, connection) = self.inner.config.connect(self.inner.tls.clone()).await?;
         let driver = AbortOnDropHandle::new(tokio::spawn(async move {
@@ -189,7 +201,18 @@ impl PgStore {
                 ));
             }
         };
-        let outcome = tokio::time::timeout(self.inner.deadline, async {
+
+        self.execute(permit, self.inner.deadline, work).await
+    }
+
+    /// Runs `work` under `permit` within `deadline`, then frees the permit.
+    async fn execute<T>(
+        &self,
+        permit: SemaphorePermit<'_>,
+        deadline: Duration,
+        work: impl AsyncFnOnce(&mut Database) -> Result<T, tokio_postgres::Error>,
+    ) -> Result<T, StoreError> {
+        let outcome = tokio::time::timeout(deadline, async {
             let mut connection = self.connect().await?;
 
             work(&mut connection.client).await

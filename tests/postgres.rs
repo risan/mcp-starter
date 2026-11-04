@@ -908,3 +908,121 @@ async fn a_burst_of_exchanges_beside_a_locked_family_leaves_a_permit_for_verific
 
     locked.commit().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_slow_prune_is_cut_after_two_seconds_and_the_pair_is_still_returned() {
+    let Some(postgres) = Postgres::ready().await else {
+        return;
+    };
+    let store = postgres.store_with_limits(Duration::from_secs(1), Duration::from_secs(8));
+    let db = postgres.superuser().await;
+    let mut holder = postgres.superuser().await;
+    let at = now().as_second();
+
+    store.register_client(client("c"), now()).await.unwrap();
+    db.batch_execute(&format!(
+        "insert into oauth_families
+             values ('slow', 'c', '42', 'Pat', 'example', '{RESOURCE}', {granted}, {old});
+         insert into oauth_tokens values ('slow-token', 'slow', 'refresh', {old}, false)",
+        granted = at - 10_000_000,
+        old = at - 7_200,
+    ))
+    .await
+    .unwrap();
+
+    // The prune deletes the family, which deletes this token row, and a lock holds it.
+    let blocked = holder.transaction().await.unwrap();
+
+    blocked
+        .query(
+            "select 1 from oauth_tokens where token_hash = 'slow-token' for update",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let started = Instant::now();
+    let issued = grant("cut-short", "c", "42");
+    let granted = store.exchange_code(issued.clone(), now()).await.unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(granted, Granted::Issued(()));
+    assert!(
+        elapsed >= Duration::from_millis(1800) && elapsed < Duration::from_millis(3500),
+        "the prune ran {elapsed:?}"
+    );
+    assert!(verified(&store, &issued.tokens, now()).await);
+
+    blocked.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_exchange_skips_its_prune_when_no_permit_is_free_after_it() {
+    let Some(postgres) = Postgres::ready().await else {
+        return;
+    };
+    let store = postgres.store_with_limits(Duration::from_secs(5), Duration::from_secs(5));
+    let db = postgres.superuser().await;
+    let at = now().as_second();
+
+    store.register_client(client("c"), now()).await.unwrap();
+    db.batch_execute(&format!(
+        "insert into oauth_families
+             values ('old', 'c', '42', 'Pat', 'example', '{RESOURCE}', {granted}, {old})",
+        granted = at - 10_000_000,
+        old = at - 7_200,
+    ))
+    .await
+    .unwrap();
+
+    let mut held = Vec::new();
+
+    for _ in 0..4 {
+        held.push(store.hold_permit().await);
+    }
+
+    // The exchange waits for a permit first, a bearer check second. When the exchange gives
+    // its permit back, the waiting check gets it, so the prune finds none free.
+    let exchanging = {
+        let store = store.clone();
+        let issued = grant("no-prune", "c", "42");
+
+        tokio::spawn(async move {
+            let granted = store.exchange_code(issued, now()).await;
+
+            (granted, Instant::now())
+        })
+    };
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let checking = {
+        let store = store.clone();
+
+        tokio::spawn(
+            async move { verified(&store, &grant("other", "c", "42").tokens, now()).await },
+        )
+    };
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let released = Instant::now();
+
+    held.pop();
+
+    let (granted, answered) = exchanging.await.unwrap();
+
+    assert_eq!(granted.unwrap(), Granted::Issued(()));
+    assert!(
+        answered.duration_since(released) < Duration::from_secs(2),
+        "the exchange waited for a permit to prune"
+    );
+    assert_eq!(
+        count(&db, "select count(*) from oauth_families where id = 'old'").await,
+        1,
+        "the prune ran without a free permit"
+    );
+
+    held.clear();
+    checking.await.unwrap();
+}

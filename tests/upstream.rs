@@ -1168,10 +1168,9 @@ async fn a_sign_in_taken_before_a_revocation_cannot_finish_after_it() {
     assert!(tokens.is_none());
 }
 
-#[tokio::test]
-async fn a_flow_older_than_fifteen_minutes_is_refused_after_its_revocation_was_forgotten() {
-    let rig = GatedRig::new(Stop::HasConsent).await;
-
+/// Pat is revoked while the sign-in waits in the store; the consent page shows at 2 s, Pat
+/// allows at 601 s, and the code is returned.
+async fn code_of_a_flow_revoked_at_the_start(rig: &GatedRig) -> String {
     rig.arm();
 
     let signing_in = {
@@ -1196,11 +1195,27 @@ async fn a_flow_older_than_fifteen_minutes_is_refused_after_its_revocation_was_f
     rig.advance(599.0);
 
     let allowed = rig.client.decide(&ticket, "allow", Some(&cookie)).await;
-    let code = allowed.location_param("code").unwrap();
 
-    // 900.5 s after the sign-in began: the code lives until 901 s, Pat's revocation is older
-    // than fifteen minutes and goes when Sam's is recorded. Only the flow's age refuses it.
+    allowed.location_param("code").unwrap()
+}
+
+#[tokio::test]
+async fn a_revocation_still_refuses_its_flow_after_another_subject_is_revoked_much_later() {
+    let rig = GatedRig::new(Stop::HasConsent).await;
+    let code = code_of_a_flow_revoked_at_the_start(&rig).await;
+
     rig.advance(299.5);
     rig.oauth.revoke_subject(SAM.0).await.unwrap();
+    rig.assert_code_is_dead(&code).await;
+}
+
+#[tokio::test]
+async fn a_revocation_still_refuses_its_flow_when_the_clock_moves_backwards() {
+    let rig = GatedRig::new(Stop::HasConsent).await;
+    let code = code_of_a_flow_revoked_at_the_start(&rig).await;
+
+    rig.advance(299.5);
+    rig.oauth.revoke_subject(SAM.0).await.unwrap();
+    rig.advance(-300.0);
     rig.assert_code_is_dead(&code).await;
 }

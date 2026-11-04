@@ -9,8 +9,8 @@ use std::collections::HashMap;
 
 use super::register::{parse_loopback, redirect_matches};
 use super::{
-    CODE_TTL, CSRF_TTL, CodeRecord, CsrfRecord, Flow, GrantStore, LOCKOUT_FAILS, LOCKOUT_WINDOW,
-    OAuth, OFFLINE_ACCESS, SignIn, Subject, hash_token, insert_bounded, parse_pairs, random_token,
+    CODE_TTL, CSRF_TTL, CodeRecord, CsrfRecord, GrantStore, LOCKOUT_FAILS, LOCKOUT_WINDOW, OAuth,
+    OFFLINE_ACCESS, SignIn, Subject, hash_token, insert_bounded, parse_pairs, random_token,
 };
 use crate::store::Client;
 use crate::work::ConnPermit;
@@ -74,7 +74,8 @@ impl AuthRequest {
 }
 
 enum CsrfCheck {
-    Valid,
+    /// The `seq` the page was shown at, where the flow began.
+    Valid(u64),
     Expired,
     Altered,
 }
@@ -301,6 +302,7 @@ impl<St: GrantStore> OAuth<St> {
         let record = CsrfRecord {
             expires: now + CSRF_TTL,
             params_hash: request.hash(),
+            start_seq: pending.seq,
             seq: pending.seq,
         };
 
@@ -321,7 +323,7 @@ impl<St: GrantStore> OAuth<St> {
         match record {
             Some(record) if now < record.expires => {
                 if record.params_hash == request.hash() {
-                    CsrfCheck::Valid
+                    CsrfCheck::Valid(record.start_seq)
                 } else {
                     CsrfCheck::Altered
                 }
@@ -366,6 +368,7 @@ impl<St: GrantStore> OAuth<St> {
         hash: String,
         password: String,
         request: AuthRequest,
+        start_seq: u64,
     ) -> Attempt {
         let _attempt = self.inner.password_lock.lock().await;
 
@@ -390,9 +393,7 @@ impl<St: GrantStore> OAuth<St> {
 
         self.pending().failures.clear();
 
-        let flow = self.flow_now();
-
-        Attempt::Granted(self.issue_code(request, Subject::owner(), Some(hash), flow))
+        Attempt::Granted(self.issue_code(request, Subject::owner(), Some(hash), start_seq))
     }
 
     /// Keeps an authorization code for the request and returns it.
@@ -401,7 +402,7 @@ impl<St: GrantStore> OAuth<St> {
         request: AuthRequest,
         subject: Subject,
         owner_hash: Option<String>,
-        flow: Flow,
+        start_seq: u64,
     ) -> String {
         let code = random_token(32);
         let now = self.now();
@@ -423,7 +424,7 @@ impl<St: GrantStore> OAuth<St> {
             resource,
             subject,
             owner_hash,
-            flow,
+            start_seq,
             expires: now + CODE_TTL,
             seq: pending.seq,
         };
@@ -582,8 +583,8 @@ async fn approve<St: GrantStore>(oauth: OAuth<St>, headers: HeaderMap, body: Byt
     let fields = parse_pairs(&body);
     let request = AuthRequest::from_fields(&fields);
 
-    match oauth.take_csrf(fields.get("csrf").map_or("", String::as_str), &request) {
-        CsrfCheck::Valid => {}
+    let start_seq = match oauth.take_csrf(fields.get("csrf").map_or("", String::as_str), &request) {
+        CsrfCheck::Valid(start_seq) => start_seq,
         CsrfCheck::Expired => {
             return error_page(
                 StatusCode::BAD_REQUEST,
@@ -596,7 +597,7 @@ async fn approve<St: GrantStore>(oauth: OAuth<St>, headers: HeaderMap, body: Byt
                 "The form does not match the page that was shown. Start the connection again from Claude.",
             );
         }
-    }
+    };
 
     let client = match oauth.validate_target(&request).await {
         Ok(client) => client,
@@ -625,7 +626,7 @@ async fn approve<St: GrantStore>(oauth: OAuth<St>, headers: HeaderMap, body: Byt
     let password = fields.get("password").cloned().unwrap_or_default();
     let attempt = oauth
         .clone()
-        .attempt_password(hash, password, request.clone())
+        .attempt_password(hash, password, request.clone(), start_seq)
         .await;
 
     match attempt {

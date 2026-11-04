@@ -40,9 +40,6 @@ const REFRESH_TTL: SignedDuration = SignedDuration::from_hours(60 * 24);
 const CODE_TTL: SignedDuration = SignedDuration::from_mins(5);
 const CSRF_TTL: SignedDuration = SignedDuration::from_mins(10);
 const MAX_PENDING: usize = 100;
-/// The longest a flow may take, from `GET /authorize` to the code exchange: a consent page
-/// (`CSRF_TTL`) and then the code (`CODE_TTL`).
-const MAX_FLOW: SignedDuration = SignedDuration::from_mins(15);
 const BODY_LIMIT: usize = 64 << 10;
 const LOCKOUT_FAILS: usize = 5;
 const LOCKOUT_WINDOW: SignedDuration = SignedDuration::from_mins(15);
@@ -265,6 +262,7 @@ trait Expiring {
 struct CsrfRecord {
     expires: Timestamp,
     params_hash: String,
+    start_seq: u64,
     seq: u64,
 }
 
@@ -289,7 +287,7 @@ struct CodeRecord {
     /// the code worthless, including one approved by an attempt that was already queued.
     /// `None` when the person signed in upstream.
     owner_hash: Option<String>,
-    flow: Flow,
+    start_seq: u64,
     expires: Timestamp,
     seq: u64,
 }
@@ -333,7 +331,8 @@ fn insert_bounded<R: Expiring>(
 struct SignInRecord {
     request: AuthRequest,
     browser: String,
-    flow: Flow,
+    start_seq: u64,
+    started_at: Timestamp,
     expires: Timestamp,
     seq: u64,
 }
@@ -353,7 +352,7 @@ struct ConsentRecord {
     request: AuthRequest,
     subject: Subject,
     browser: String,
-    flow: Flow,
+    start_seq: u64,
     expires: Timestamp,
     seq: u64,
 }
@@ -368,26 +367,12 @@ impl Expiring for ConsentRecord {
     }
 }
 
-/// Where a flow began, from `GET /authorize` on. It travels unchanged through the pending
-/// sign-in, the consent ticket and the code, and the code exchange judges the flow by it.
-#[derive(Clone, Copy)]
-struct Flow {
-    /// The value of `PendingState::seq` when the flow began.
-    seq: u64,
-    started_at: Timestamp,
-}
-
-/// When a subject was last revoked: the `seq` the revocation took, and the time.
-struct Revocation {
-    seq: u64,
-    at: Timestamp,
-}
-
 #[derive(Default)]
 struct PendingState {
     seq: u64,
-    /// Dropped by the next revocation once older than `MAX_FLOW`.
-    revocations: HashMap<String, Revocation>,
+    /// The `seq` of each subject's latest revocation. Never pruned: a subject exists only after
+    /// a successful sign-in, so this holds one entry per real user.
+    revocations: HashMap<String, u64>,
     csrf: HashMap<String, CsrfRecord>,
     codes: HashMap<String, CodeRecord>,
     sign_ins: HashMap<String, SignInRecord>,
@@ -506,22 +491,13 @@ impl<St: GrantStore> OAuth<St> {
     /// It also makes every flow that began before it unable to produce a usable code, so a
     /// consent that is being saved at this moment ends in a refused exchange.
     pub fn forget_subject(&self, id: &str) {
-        let now = self.now();
         let mut pending = self.pending();
 
         pending.seq += 1;
 
-        let revocation = Revocation {
-            seq: pending.seq,
-            at: now,
-        };
+        let seq = pending.seq;
 
-        // A flow that began before a revocation is refused after its start plus MAX_FLOW, which
-        // is before the revocation plus MAX_FLOW, so an older entry has nothing left to refuse.
-        pending
-            .revocations
-            .retain(|_, existing| now < existing.at + MAX_FLOW);
-        pending.revocations.insert(id.to_string(), revocation);
+        pending.revocations.insert(id.to_string(), seq);
         pending.codes.retain(|_, record| record.subject.id != id);
         pending.consents.retain(|_, record| record.subject.id != id);
     }
@@ -542,22 +518,12 @@ impl<St: GrantStore> OAuth<St> {
         self.inner.store.revoke_subject(id, self.now()).await
     }
 
-    /// The flow of a code issued right now, for sign-ins that need no upstream round trip.
-    fn flow_now(&self) -> Flow {
-        Flow {
-            seq: self.pending().seq,
-            started_at: self.now(),
-        }
-    }
-
-    /// Whether a code of `flow` for `id` may no longer be exchanged.
-    fn flow_is_dead(&self, id: &str, flow: Flow) -> bool {
-        self.now() > flow.started_at + MAX_FLOW
-            || self
-                .pending()
-                .revocations
-                .get(id)
-                .is_some_and(|revocation| revocation.seq > flow.seq)
+    /// Whether `id` was revoked after the flow that began at `start_seq`.
+    fn is_revoked_since(&self, id: &str, start_seq: u64) -> bool {
+        self.pending()
+            .revocations
+            .get(id)
+            .is_some_and(|revoked| *revoked > start_seq)
     }
 
     /// Checks a bearer access token against the store. A token issued for another resource

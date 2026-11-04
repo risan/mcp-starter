@@ -1432,6 +1432,43 @@ async fn attempt_queued_across_a_password_change_yields_a_dead_code() {
     assert!(rig.state().await.tokens.is_empty());
 }
 
+#[tokio::test]
+async fn a_revocation_during_a_held_password_check_leaves_no_usable_code() {
+    let rig = support::rig().await;
+    let client_id = rig.client.register(&[CLAUDE_CALLBACK]).await;
+    let (form, _) = rig
+        .client
+        .consent(&authorize_params(&INFO, &client_id, CLAUDE_CALLBACK))
+        .await;
+    let form = form.unwrap();
+
+    rig.probe.hold();
+
+    let client = rig.client.clone();
+    let approving = tokio::spawn(async move { client.approve(&form, OWNER_PASSWORD).await });
+
+    wait_until(
+        Duration::from_secs(5),
+        "the password check to start",
+        || rig.probe.started() >= 1,
+    )
+    .await;
+    rig.oauth.revoke_subject("owner").await.unwrap();
+    rig.probe.release();
+
+    let approved = approving.await.unwrap();
+    let code = approved
+        .location_param("code")
+        .unwrap_or_else(|| panic!("no code ({}): {}", approved.status, approved.body));
+    let (reply, tokens) = rig
+        .client
+        .exchange(&client_id, CLAUDE_CALLBACK, &code, VERIFIER)
+        .await;
+
+    assert_eq!(reply.error_code(), "invalid_grant", "{}", reply.body);
+    assert!(tokens.is_none());
+}
+
 async fn submit_wrong_passwords(
     rig: &OAuthRig<TestState>,
     client_id: &str,

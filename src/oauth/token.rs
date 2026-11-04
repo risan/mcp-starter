@@ -189,7 +189,7 @@ impl<St: GrantStore> OAuth<St> {
             return Err(OAuthError::invalid_grant());
         }
 
-        if self.flow_is_dead(&record.subject.id, record.flow) {
+        if self.is_revoked_since(&record.subject.id, record.start_seq) {
             return Err(OAuthError::invalid_grant());
         }
 

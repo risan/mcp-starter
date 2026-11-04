@@ -20,7 +20,7 @@ use super::authorize::{
     redirect_target, request_warning, security_policy,
 };
 use super::{
-    CSRF_TTL, ConsentRecord, Flow, GrantStore, OAuth, PasswordChecker, SignInRecord, Subject,
+    CSRF_TTL, ConsentRecord, GrantStore, OAuth, PasswordChecker, SignInRecord, Subject,
     constant_time_eq, hash_token, insert_bounded, parse_pairs, random_token,
 };
 use crate::store::Client;
@@ -52,13 +52,14 @@ pub enum SignIn {
 pub struct Pending {
     request: AuthRequest,
     browser: String,
-    flow: Flow,
+    start_seq: u64,
+    started_at: Timestamp,
 }
 
 impl Pending {
     /// When the person's browser reached `GET /authorize`.
     pub fn started_at(&self) -> Timestamp {
-        self.flow.started_at
+        self.started_at
     }
 }
 
@@ -176,10 +177,8 @@ impl<St: GrantStore> OAuth<St> {
             let record = SignInRecord {
                 request,
                 browser: hash_token(&cookie),
-                flow: Flow {
-                    seq: pending.seq,
-                    started_at: now,
-                },
+                start_seq: pending.seq,
+                started_at: now,
                 expires: now + CSRF_TTL,
                 seq: pending.seq,
             };
@@ -227,7 +226,8 @@ impl<St: GrantStore> OAuth<St> {
         Ok(Pending {
             request: record.request,
             browser: record.browser,
-            flow: record.flow,
+            start_seq: record.start_seq,
+            started_at: record.started_at,
         })
     }
 
@@ -263,7 +263,8 @@ impl<St: GrantStore> OAuth<St> {
             .await
         {
             Ok(true) => {
-                let code = self.issue_code(pending.request.clone(), subject, None, pending.flow);
+                let code =
+                    self.issue_code(pending.request.clone(), subject, None, pending.start_seq);
 
                 grant_redirect(self, &pending.request, &code)
             }
@@ -310,7 +311,7 @@ impl<St: GrantStore> OAuth<St> {
                 request: pending.request,
                 subject,
                 browser: pending.browser,
-                flow: pending.flow,
+                start_seq: pending.start_seq,
                 expires: now + CSRF_TTL,
                 seq: state.seq,
             };
@@ -409,7 +410,12 @@ impl<St: GrantStore> OAuth<St> {
             );
         }
 
-        let code = self.issue_code(record.request.clone(), record.subject, None, record.flow);
+        let code = self.issue_code(
+            record.request.clone(),
+            record.subject,
+            None,
+            record.start_seq,
+        );
 
         grant_redirect(self, &record.request, &code)
     }

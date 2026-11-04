@@ -10,6 +10,7 @@ use std::error::Error as _;
 use std::sync::Arc;
 #[cfg(feature = "test-support")]
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use jiff::Timestamp;
@@ -60,6 +61,8 @@ struct Inner {
     permits: Semaphore,
     permit_wait: Duration,
     deadline: Duration,
+    /// Set while a prune runs, so a burst of exchanges holds at most one permit for pruning.
+    pruning: AtomicBool,
     #[cfg(feature = "test-support")]
     seeded: Mutex<std::collections::HashMap<String, TokenInfo>>,
 }
@@ -136,6 +139,7 @@ impl PgStore {
                 permits: Semaphore::new(PERMITS),
                 permit_wait,
                 deadline,
+                pruning: AtomicBool::new(false),
                 #[cfg(feature = "test-support")]
                 seeded: Mutex::new(Default::default()),
             }),
@@ -406,12 +410,15 @@ impl GrantStore for PgStore {
             .await?;
 
         // After the answer is settled and on its own: a blocked prune must not turn a committed
-        // grant into an error. `run` logs its failure.
-        if granted == Granted::Issued(()) {
+        // grant into an error. `run` logs its failure. One prune at a time, so blocked ones
+        // cannot take every permit. The task is not tracked: its deadline bounds it.
+        if granted == Granted::Issued(()) && !self.inner.pruning.swap(true, Ordering::SeqCst) {
             let store = self.clone();
 
             tokio::spawn(async move {
                 let _ = store.prune_families(now).await;
+
+                store.inner.pruning.store(false, Ordering::SeqCst);
             });
         }
 

@@ -552,11 +552,23 @@ async fn a_code_exchange_prunes_families_expired_over_an_hour_ago() {
         "their tokens went with them"
     );
 
-    store
-        .exchange_code(grant("prune-2", "c", "42"), now())
-        .await
-        .unwrap();
-    wait_for_count(&db, old, 0).await;
+    // A prune still winding down may swallow one exchange's prune, so exchange until the rest went.
+    let started = Instant::now();
+    let mut round = 0;
+
+    while count(&db, old).await != 0 {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the rest never went"
+        );
+
+        round += 1;
+        store
+            .exchange_code(grant(&format!("prune-more-{round}"), "c", "42"), now())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     assert_eq!(count(&db, old).await, 0, "the rest went");
     assert_eq!(
@@ -849,6 +861,71 @@ async fn a_blocked_prune_does_not_lose_the_token_pair() {
         started.elapsed()
     );
     assert!(verified(&store, &issued.tokens, now()).await);
+
+    blocked.commit().await.unwrap();
+    wait_for_count(
+        &db,
+        "select count(*) from oauth_families where id = 'stuck'",
+        0,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn blocked_prunes_never_hold_more_than_one_permit() {
+    let Some(postgres) = Postgres::ready().await else {
+        return;
+    };
+    let store = postgres.store_with_limits(Duration::from_secs(1), Duration::from_secs(5));
+    let db = postgres.superuser().await;
+    let mut holder = postgres.superuser().await;
+    let at = now().as_second();
+
+    store.register_client(client("c"), now()).await.unwrap();
+    db.batch_execute(&format!(
+        "insert into oauth_families
+             values ('stuck', 'c', '42', 'Pat', 'example', '{RESOURCE}', {granted}, {old})",
+        granted = at - 10_000_000,
+        old = at - 7_200,
+    ))
+    .await
+    .unwrap();
+
+    let blocked = holder.transaction().await.unwrap();
+
+    blocked
+        .query(
+            "select 1 from oauth_families where id = 'stuck' for update",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let exchanges = (0..6).map(|number| {
+        let store = store.clone();
+        let issued = grant(&format!("burst-{number}"), "c", "42");
+
+        tokio::spawn(async move {
+            let granted = store.exchange_code(issued.clone(), now()).await.unwrap();
+
+            (granted, issued)
+        })
+    });
+    let mut last = None;
+
+    for exchange in exchanges.collect::<Vec<_>>() {
+        let (granted, issued) = exchange.await.unwrap();
+
+        assert_eq!(granted, Granted::Issued(()));
+
+        last = Some(issued);
+    }
+
+    wait_for_waiting(&db, 1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(waiting(&db).await, 1, "more than one prune is running");
+    assert!(verified(&store, &last.unwrap().tokens, now()).await);
 
     blocked.commit().await.unwrap();
     wait_for_count(

@@ -731,12 +731,31 @@ async fn an_unusable_subject_is_refused_and_a_long_name_is_cut() {
     assert!(!reply.body.contains(&"n".repeat(257)));
 }
 
-/// A store whose code exchange stops inside the write until the test lets it go, so a test can
-/// run another operation while an exchange has already taken its code.
+/// The store call a [`GatedStore`] stops in.
+#[derive(Clone, Copy, PartialEq)]
+enum Stop {
+    ExchangeCode,
+    HasConsent,
+    SaveConsent,
+}
+
+/// A store that stops inside one call, once armed, until the test lets it go, so a test can run
+/// another operation while a flow is paused in the middle.
 struct GatedStore<St> {
     inner: St,
+    stop: Stop,
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     entered: std::sync::Arc<tokio::sync::Notify>,
     release: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl<St> GatedStore<St> {
+    async fn pause_at(&self, stop: Stop) {
+        if self.stop == stop && self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.acquire().await.unwrap().forget();
+        }
+    }
 }
 
 impl<St: GrantStore> GrantStore for GatedStore<St> {
@@ -760,8 +779,7 @@ impl<St: GrantStore> GrantStore for GatedStore<St> {
         grant: mcp_starter::oauth::NewGrant,
         now: jiff::Timestamp,
     ) -> Result<mcp_starter::oauth::Granted<()>, mcp_starter::store::StoreError> {
-        self.entered.notify_one();
-        self.release.acquire().await.unwrap().forget();
+        self.pause_at(Stop::ExchangeCode).await;
 
         self.inner.exchange_code(grant, now).await
     }
@@ -808,7 +826,11 @@ impl<St: GrantStore> GrantStore for GatedStore<St> {
         subject: &str,
         client_id: &str,
     ) -> Result<bool, mcp_starter::store::StoreError> {
-        self.inner.has_consent(subject, client_id).await
+        let consent = self.inner.has_consent(subject, client_id).await;
+
+        self.pause_at(Stop::HasConsent).await;
+
+        consent
     }
 
     async fn save_consent(
@@ -817,7 +839,11 @@ impl<St: GrantStore> GrantStore for GatedStore<St> {
         client_id: &str,
         now: jiff::Timestamp,
     ) -> Result<(), mcp_starter::store::StoreError> {
-        self.inner.save_consent(subject, client_id, now).await
+        let saved = self.inner.save_consent(subject, client_id, now).await;
+
+        self.pause_at(Stop::SaveConsent).await;
+
+        saved
     }
 
     async fn revoke_subject(
@@ -829,54 +855,113 @@ impl<St: GrantStore> GrantStore for GatedStore<St> {
     }
 }
 
+/// A server over a [`GatedStore`] that stops at `stop` once `armed` is set.
+struct GatedRig {
+    oauth: mcp_starter::oauth::OAuth<GatedStore<mcp_starter::store::Store<support::TestState>>>,
+    client: OAuthClient,
+    client_id: String,
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    entered: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Semaphore>,
+    _dir: tempfile::TempDir,
+}
+
+impl GatedRig {
+    async fn new(stop: Stop) -> GatedRig {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        use mcp_starter::oauth::{OAuth, SignIn};
+        use mcp_starter::store::{Store, StoreOptions};
+        use mcp_starter::test_support::TestClock;
+        use mcp_starter::test_support::oauth_flow::{TestUpstream, upstream_routes};
+        use mcp_starter::work::Work;
+        use tokio_util::task::TaskTracker;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::<support::TestState>::open(dir.path(), StoreOptions::default()).unwrap();
+        let armed = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let gated = GatedStore {
+            inner: store,
+            stop,
+            armed: armed.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+        };
+        let oauth = OAuth::new(
+            &support::INFO,
+            gated,
+            ISSUER,
+            TestClock::new("2026-10-24T09:00:00Z").as_clock(),
+            SignIn::Upstream(Arc::new(TestUpstream)),
+            Work::new(TaskTracker::new()),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = upstream_routes(oauth.clone());
+
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = OAuthClient::new(&support::INFO, &format!("http://{address}"));
+        let client_id = client.register(&[CLAUDE_CALLBACK]).await;
+
+        GatedRig {
+            oauth,
+            client,
+            client_id,
+            armed,
+            entered,
+            release,
+            _dir: dir,
+        }
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Waits until the flow is stopped inside the store, runs `revoke_subject` for Pat, then
+    /// lets the flow go.
+    async fn revoke_pat_while_paused(&self) {
+        self.entered.notified().await;
+        self.oauth.revoke_subject(PAT.0).await.unwrap();
+        self.release.add_permits(1);
+    }
+
+    /// Exchanges `code` and asserts that nothing came of it.
+    async fn assert_code_is_dead(&self, code: &str) {
+        let (reply, tokens) = self
+            .client
+            .exchange(&self.client_id, CLAUDE_CALLBACK, code, VERIFIER)
+            .await;
+
+        assert_eq!(reply.error_code(), "invalid_grant", "{}", reply.body);
+        assert!(tokens.is_none());
+    }
+}
+
 #[tokio::test]
 async fn an_exchange_paused_in_the_store_write_cannot_outlive_revoke_subject() {
-    use std::sync::Arc;
     use std::time::Duration;
 
-    use mcp_starter::oauth::{OAuth, SignIn};
-    use mcp_starter::store::{Store, StoreOptions};
-    use mcp_starter::test_support::TestClock;
-    use mcp_starter::test_support::oauth_flow::{TestUpstream, upstream_routes};
-    use mcp_starter::work::Work;
-    use tokio_util::task::TaskTracker;
-
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::<support::TestState>::open(dir.path(), StoreOptions::default()).unwrap();
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let release = Arc::new(tokio::sync::Semaphore::new(0));
-    let gated = GatedStore {
-        inner: store,
-        entered: entered.clone(),
-        release: release.clone(),
-    };
-    let oauth = OAuth::new(
-        &support::INFO,
-        gated,
-        ISSUER,
-        TestClock::new("2026-10-24T09:00:00Z").as_clock(),
-        SignIn::Upstream(Arc::new(TestUpstream)),
-        Work::new(TaskTracker::new()),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let router = upstream_routes(oauth.clone());
-
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-
-    let client = OAuthClient::new(&support::INFO, &format!("http://{address}"));
-    let client_id = client.register(&[CLAUDE_CALLBACK]).await;
-    let (cookie, page) = client
-        .sign_in(&client_id, CLAUDE_CALLBACK, PAT.0, PAT.1)
+    let rig = GatedRig::new(Stop::ExchangeCode).await;
+    let (cookie, page) = rig
+        .client
+        .sign_in(&rig.client_id, CLAUDE_CALLBACK, PAT.0, PAT.1)
         .await;
     let ticket = OAuthClient::consent_ticket(&page).unwrap();
-    let allowed = client.decide(&ticket, "allow", Some(&cookie)).await;
+    let allowed = rig.client.decide(&ticket, "allow", Some(&cookie)).await;
     let code = allowed.location_param("code").unwrap();
+
+    rig.arm();
+
     let exchanging = {
-        let client = client.clone();
-        let client_id = client_id.clone();
+        let client = rig.client.clone();
+        let client_id = rig.client_id.clone();
 
         tokio::spawn(async move {
             client
@@ -886,16 +971,16 @@ async fn an_exchange_paused_in_the_store_write_cannot_outlive_revoke_subject() {
     };
 
     // The exchange has taken its code and is inside the store write.
-    entered.notified().await;
+    rig.entered.notified().await;
 
     let revoking = {
-        let oauth = oauth.clone();
+        let oauth = rig.oauth.clone();
 
         tokio::spawn(async move { oauth.revoke_subject(PAT.0).await })
     };
 
     tokio::time::sleep(Duration::from_millis(200)).await;
-    release.add_permits(1);
+    rig.release.add_permits(1);
 
     revoking.await.unwrap().unwrap();
 
@@ -903,10 +988,97 @@ async fn an_exchange_paused_in_the_store_write_cannot_outlive_revoke_subject() {
 
     if let Some(tokens) = tokens {
         assert!(
-            oauth.verify(&tokens.access_token).await.is_err(),
+            rig.oauth.verify(&tokens.access_token).await.is_err(),
             "the exchange finished after the revocation and left live tokens"
         );
     } else {
         assert_eq!(reply.error_code(), "invalid_grant", "{}", reply.body);
     }
+}
+
+#[tokio::test]
+async fn a_revocation_during_the_consent_write_leaves_no_usable_code() {
+    let rig = GatedRig::new(Stop::SaveConsent).await;
+    let (cookie, page) = rig
+        .client
+        .sign_in(&rig.client_id, CLAUDE_CALLBACK, PAT.0, PAT.1)
+        .await;
+    let ticket = OAuthClient::consent_ticket(&page).unwrap();
+
+    rig.arm();
+
+    let deciding = {
+        let client = rig.client.clone();
+
+        tokio::spawn(async move { client.decide(&ticket, "allow", Some(&cookie)).await })
+    };
+
+    rig.revoke_pat_while_paused().await;
+
+    let allowed = deciding.await.unwrap();
+
+    rig.assert_code_is_dead(&allowed.location_param("code").unwrap())
+        .await;
+}
+
+#[tokio::test]
+async fn a_revocation_during_the_consent_lookup_leaves_no_usable_code() {
+    let rig = GatedRig::new(Stop::HasConsent).await;
+    let (cookie, page) = rig
+        .client
+        .sign_in(&rig.client_id, CLAUDE_CALLBACK, PAT.0, PAT.1)
+        .await;
+    let ticket = OAuthClient::consent_ticket(&page).unwrap();
+
+    rig.client.decide(&ticket, "allow", Some(&cookie)).await;
+    rig.arm();
+
+    let signing_in = {
+        let client = rig.client.clone();
+        let client_id = rig.client_id.clone();
+
+        tokio::spawn(async move {
+            client
+                .sign_in(&client_id, CLAUDE_CALLBACK, PAT.0, PAT.1)
+                .await
+        })
+    };
+
+    rig.revoke_pat_while_paused().await;
+
+    let (_, back) = signing_in.await.unwrap();
+
+    rig.assert_code_is_dead(&back.location_param("code").unwrap())
+        .await;
+}
+
+#[tokio::test]
+async fn a_code_issued_after_a_revocation_still_works() {
+    let rig = GatedRig::new(Stop::ExchangeCode).await;
+
+    rig.oauth.revoke_subject(PAT.0).await.unwrap();
+
+    let (cookie, page) = rig
+        .client
+        .sign_in(&rig.client_id, CLAUDE_CALLBACK, PAT.0, PAT.1)
+        .await;
+    let ticket = OAuthClient::consent_ticket(&page).unwrap();
+    let allowed = rig.client.decide(&ticket, "allow", Some(&cookie)).await;
+    let (reply, tokens) = rig
+        .client
+        .exchange(
+            &rig.client_id,
+            CLAUDE_CALLBACK,
+            &allowed.location_param("code").unwrap(),
+            VERIFIER,
+        )
+        .await;
+
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        rig.oauth
+            .verify(&tokens.unwrap().access_token)
+            .await
+            .is_ok()
+    );
 }

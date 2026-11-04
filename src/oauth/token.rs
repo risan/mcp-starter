@@ -189,6 +189,10 @@ impl<St: GrantStore> OAuth<St> {
             return Err(OAuthError::invalid_grant());
         }
 
+        if self.revoked_since(&record.subject.id, record.stamp) {
+            return Err(OAuthError::invalid_grant());
+        }
+
         if !grant.resource.is_empty() && grant.resource != record.resource {
             return Err(OAuthError::bad_request(
                 "invalid_target",

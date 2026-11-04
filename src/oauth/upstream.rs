@@ -248,6 +248,7 @@ impl<St: GrantStore> OAuth<St> {
                 "The sign-in could not be completed.",
             );
         };
+        let stamp = self.revocation_stamp();
         let client = match self.validate_target(&pending.request).await {
             Ok(client) => client,
             Err(problem) => return error_page(StatusCode::BAD_REQUEST, problem),
@@ -260,11 +261,11 @@ impl<St: GrantStore> OAuth<St> {
             .await
         {
             Ok(true) => {
-                let code = self.issue_code(pending.request.clone(), subject, None);
+                let code = self.issue_code(pending.request.clone(), subject, None, stamp);
 
                 grant_redirect(self, &pending.request, &code)
             }
-            Ok(false) => self.ask_consent(pending, &client, subject),
+            Ok(false) => self.ask_consent(pending, &client, subject, stamp),
             Err(_) => error_page(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "The sign-in could not be completed.",
@@ -272,7 +273,13 @@ impl<St: GrantStore> OAuth<St> {
         }
     }
 
-    fn ask_consent(&self, pending: Pending, client: &Client, subject: Subject) -> Response {
+    fn ask_consent(
+        &self,
+        pending: Pending,
+        client: &Client,
+        subject: Subject,
+        stamp: u64,
+    ) -> Response {
         let ticket = random_token(32);
         let now = self.now();
         let (target, host) = redirect_target(&pending.request.redirect_uri);
@@ -307,6 +314,7 @@ impl<St: GrantStore> OAuth<St> {
                 request: pending.request,
                 subject,
                 browser: pending.browser,
+                stamp,
                 expires: now + CSRF_TTL,
                 seq: state.seq,
             };
@@ -405,7 +413,7 @@ impl<St: GrantStore> OAuth<St> {
             );
         }
 
-        let code = self.issue_code(record.request.clone(), record.subject, None);
+        let code = self.issue_code(record.request.clone(), record.subject, None, record.stamp);
 
         grant_redirect(self, &record.request, &code)
     }

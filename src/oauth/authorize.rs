@@ -390,7 +390,9 @@ impl<St: GrantStore> OAuth<St> {
 
         self.pending().failures.clear();
 
-        Attempt::Granted(self.issue_code(request, Subject::owner(), Some(hash)))
+        let stamp = self.revocation_stamp();
+
+        Attempt::Granted(self.issue_code(request, Subject::owner(), Some(hash), stamp))
     }
 
     /// Keeps an authorization code for the request and returns it.
@@ -399,6 +401,7 @@ impl<St: GrantStore> OAuth<St> {
         request: AuthRequest,
         subject: Subject,
         owner_hash: Option<String>,
+        stamp: u64,
     ) -> String {
         let code = random_token(32);
         let now = self.now();
@@ -420,6 +423,7 @@ impl<St: GrantStore> OAuth<St> {
             resource,
             subject,
             owner_hash,
+            stamp,
             expires: now + CODE_TTL,
             seq: pending.seq,
         };

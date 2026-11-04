@@ -10,7 +10,6 @@ use std::error::Error as _;
 use std::sync::Arc;
 #[cfg(feature = "test-support")]
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use jiff::Timestamp;
@@ -61,15 +60,14 @@ struct Inner {
     permits: Semaphore,
     permit_wait: Duration,
     deadline: Duration,
-    /// Set while a prune runs, so a burst of exchanges holds at most one permit for pruning.
-    pruning: AtomicBool,
     #[cfg(feature = "test-support")]
     seeded: Mutex<std::collections::HashMap<String, TokenInfo>>,
 }
 
 impl PgStore {
     /// Removes some families that expired over an hour ago, a batch at a time, with a permit
-    /// and a deadline of its own.
+    /// and a deadline of its own. A family another operation holds locked is left for the next
+    /// prune, so this never waits on a lock.
     async fn prune_families(&self, now: Timestamp) -> Result<(), StoreError> {
         let cutoff = now.as_second() - PRUNE_AFTER_SECONDS;
 
@@ -77,7 +75,8 @@ impl PgStore {
             database
                 .execute_typed(
                     "delete from oauth_families
-                     where id in (select id from oauth_families where expires_at < $1 limit $2)
+                     where id in (select id from oauth_families where expires_at < $1
+                                  limit $2 for update skip locked)
                        and expires_at < $1",
                     &[(&cutoff, Type::INT8), (&PRUNE_BATCH, Type::INT8)],
                 )
@@ -139,7 +138,6 @@ impl PgStore {
                 permits: Semaphore::new(PERMITS),
                 permit_wait,
                 deadline,
-                pruning: AtomicBool::new(false),
                 #[cfg(feature = "test-support")]
                 seeded: Mutex::new(Default::default()),
             }),
@@ -409,17 +407,10 @@ impl GrantStore for PgStore {
             })
             .await?;
 
-        // After the answer is settled and on its own: a blocked prune must not turn a committed
-        // grant into an error. `run` logs its failure. One prune at a time, so blocked ones
-        // cannot take every permit. The task is not tracked: its deadline bounds it.
-        if granted == Granted::Issued(()) && !self.inner.pruning.swap(true, Ordering::SeqCst) {
-            let store = self.clone();
-
-            tokio::spawn(async move {
-                let _ = store.prune_families(now).await;
-
-                store.inner.pruning.store(false, Ordering::SeqCst);
-            });
+        // After the exchange is committed and its answer settled, as an operation of its own:
+        // a failed prune is logged by `run` and never turns a committed grant into an error.
+        if granted == Granted::Issued(()) {
+            let _ = self.prune_families(now).await;
         }
 
         Ok(granted)

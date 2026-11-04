@@ -70,20 +70,6 @@ async fn waiting(db: &Db) -> i64 {
 }
 
 /// The prune runs after the exchange has answered, so its effect is waited for.
-async fn wait_for_count(db: &Db, sql: &str, expected: i64) {
-    let started = Instant::now();
-
-    while count(db, sql).await != expected {
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "never reached {expected}, have {}",
-            count(db, sql).await
-        );
-
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
 async fn wait_for_waiting(db: &Db, expected: i64) {
     let started = Instant::now();
 
@@ -539,7 +525,6 @@ async fn a_code_exchange_prunes_families_expired_over_an_hour_ago() {
         .exchange_code(grant("prune-1", "c", "42"), now())
         .await
         .unwrap();
-    wait_for_count(&db, old, 100).await;
 
     assert_eq!(count(&db, old).await, 100, "500 went");
     assert_eq!(
@@ -552,23 +537,10 @@ async fn a_code_exchange_prunes_families_expired_over_an_hour_ago() {
         "their tokens went with them"
     );
 
-    // A prune still winding down may swallow one exchange's prune, so exchange until the rest went.
-    let started = Instant::now();
-    let mut round = 0;
-
-    while count(&db, old).await != 0 {
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "the rest never went"
-        );
-
-        round += 1;
-        store
-            .exchange_code(grant(&format!("prune-more-{round}"), "c", "42"), now())
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    store
+        .exchange_code(grant("prune-2", "c", "42"), now())
+        .await
+        .unwrap();
 
     assert_eq!(count(&db, old).await, 0, "the rest went");
     assert_eq!(
@@ -819,37 +791,49 @@ async fn the_whole_upstream_flow_runs_on_postgres() {
     assert!(rig.oauth.verify(&tokens.access_token).await.is_err());
 }
 
-#[tokio::test]
-async fn a_blocked_prune_does_not_lose_the_token_pair() {
-    let Some(postgres) = Postgres::ready().await else {
-        return;
-    };
-    let store = postgres.store_with_limits(Duration::from_secs(1), Duration::from_secs(3));
-    let db = postgres.superuser().await;
-    let mut holder = postgres.superuser().await;
+/// Two families that expired over an hour ago: `locked`, which a transaction holds locked until
+/// it is committed, and `free`.
+async fn expired_families_one_locked<'a>(
+    db: &Db,
+    holder: &'a mut Db,
+) -> tokio_postgres::Transaction<'a> {
     let at = now().as_second();
 
-    store.register_client(client("c"), now()).await.unwrap();
     db.batch_execute(&format!(
-        "insert into oauth_families
-             values ('stuck', 'c', '42', 'Pat', 'example', '{RESOURCE}', {granted}, {old})",
+        "insert into oauth_families values
+             ('locked', 'c', '42', 'Pat', 'example', '{RESOURCE}', {granted}, {old}),
+             ('free', 'c', '42', 'Pat', 'example', '{RESOURCE}', {granted}, {old})",
         granted = at - 10_000_000,
         old = at - 7_200,
     ))
     .await
     .unwrap();
 
-    // The prune wants to delete this family, and a lock holds it.
-    let blocked = holder.transaction().await.unwrap();
+    let transaction = holder.transaction().await.unwrap();
 
-    blocked
+    transaction
         .query(
-            "select 1 from oauth_families where id = 'stuck' for update",
+            "select 1 from oauth_families where id = 'locked' for update",
             &[],
         )
         .await
         .unwrap();
 
+    transaction
+}
+
+#[tokio::test]
+async fn a_locked_expired_family_neither_delays_nor_fails_the_exchange() {
+    let Some(postgres) = Postgres::ready().await else {
+        return;
+    };
+    let store = postgres.store_with_limits(Duration::from_secs(1), Duration::from_secs(3));
+    let db = postgres.superuser().await;
+    let mut holder = postgres.superuser().await;
+
+    store.register_client(client("c"), now()).await.unwrap();
+
+    let locked = expired_families_one_locked(&db, &mut holder).await;
     let started = Instant::now();
     let issued = grant("pruned-around", "c", "42");
     let granted = store.exchange_code(issued.clone(), now()).await.unwrap();
@@ -861,59 +845,57 @@ async fn a_blocked_prune_does_not_lose_the_token_pair() {
         started.elapsed()
     );
     assert!(verified(&store, &issued.tokens, now()).await);
-
-    blocked.commit().await.unwrap();
-    wait_for_count(
-        &db,
-        "select count(*) from oauth_families where id = 'stuck'",
+    assert_eq!(waiting(&db).await, 0, "the prune waits on a lock");
+    assert_eq!(
+        count(&db, "select count(*) from oauth_families where id = 'free'").await,
         0,
-    )
-    .await;
-}
+        "the prune is done when the exchange answers"
+    );
 
-#[tokio::test]
-async fn blocked_prunes_never_hold_more_than_one_permit() {
-    let Some(postgres) = Postgres::ready().await else {
-        return;
-    };
-    let store = postgres.store_with_limits(Duration::from_secs(1), Duration::from_secs(5));
-    let db = postgres.superuser().await;
-    let mut holder = postgres.superuser().await;
-    let at = now().as_second();
-
-    store.register_client(client("c"), now()).await.unwrap();
-    db.batch_execute(&format!(
-        "insert into oauth_families
-             values ('stuck', 'c', '42', 'Pat', 'example', '{RESOURCE}', {granted}, {old})",
-        granted = at - 10_000_000,
-        old = at - 7_200,
-    ))
-    .await
-    .unwrap();
-
-    let blocked = holder.transaction().await.unwrap();
-
-    blocked
-        .query(
-            "select 1 from oauth_families where id = 'stuck' for update",
-            &[],
-        )
+    locked.commit().await.unwrap();
+    store
+        .exchange_code(grant("pruned-later", "c", "42"), now())
         .await
         .unwrap();
 
-    let exchanges = (0..6).map(|number| {
-        let store = store.clone();
-        let issued = grant(&format!("burst-{number}"), "c", "42");
+    assert_eq!(
+        count(
+            &db,
+            "select count(*) from oauth_families where id = 'locked'"
+        )
+        .await,
+        0,
+        "the next prune takes the family once it is free"
+    );
+}
 
-        tokio::spawn(async move {
-            let granted = store.exchange_code(issued.clone(), now()).await.unwrap();
+#[tokio::test]
+async fn a_burst_of_exchanges_beside_a_locked_family_leaves_a_permit_for_verification() {
+    let Some(postgres) = Postgres::ready().await else {
+        return;
+    };
+    let store = postgres.store_with_limits(Duration::from_secs(1), Duration::from_secs(3));
+    let db = postgres.superuser().await;
+    let mut holder = postgres.superuser().await;
 
-            (granted, issued)
+    store.register_client(client("c"), now()).await.unwrap();
+
+    let locked = expired_families_one_locked(&db, &mut holder).await;
+    let exchanges: Vec<_> = (0..6)
+        .map(|number| {
+            let store = store.clone();
+            let issued = grant(&format!("burst-{number}"), "c", "42");
+
+            tokio::spawn(async move {
+                let granted = store.exchange_code(issued.clone(), now()).await.unwrap();
+
+                (granted, issued)
+            })
         })
-    });
+        .collect();
     let mut last = None;
 
-    for exchange in exchanges.collect::<Vec<_>>() {
+    for exchange in exchanges {
         let (granted, issued) = exchange.await.unwrap();
 
         assert_eq!(granted, Granted::Issued(()));
@@ -921,17 +903,8 @@ async fn blocked_prunes_never_hold_more_than_one_permit() {
         last = Some(issued);
     }
 
-    wait_for_waiting(&db, 1).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    assert_eq!(waiting(&db).await, 1, "more than one prune is running");
+    assert_eq!(waiting(&db).await, 0, "a prune waits on a lock");
     assert!(verified(&store, &last.unwrap().tokens, now()).await);
 
-    blocked.commit().await.unwrap();
-    wait_for_count(
-        &db,
-        "select count(*) from oauth_families where id = 'stuck'",
-        0,
-    )
-    .await;
+    locked.commit().await.unwrap();
 }

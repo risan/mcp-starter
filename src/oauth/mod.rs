@@ -40,9 +40,9 @@ const REFRESH_TTL: SignedDuration = SignedDuration::from_hours(60 * 24);
 const CODE_TTL: SignedDuration = SignedDuration::from_mins(5);
 const CSRF_TTL: SignedDuration = SignedDuration::from_mins(10);
 const MAX_PENDING: usize = 100;
-/// How long a flow that began before a revocation can still produce a code: a consent page and
-/// then the code.
-const REVOCATION_MEMORY: SignedDuration = SignedDuration::from_mins(15);
+/// The longest a flow may take, from `GET /authorize` to the code exchange: a consent page
+/// (`CSRF_TTL`) and then the code (`CODE_TTL`).
+const MAX_FLOW: SignedDuration = SignedDuration::from_mins(15);
 const BODY_LIMIT: usize = 64 << 10;
 const LOCKOUT_FAILS: usize = 5;
 const LOCKOUT_WINDOW: SignedDuration = SignedDuration::from_mins(15);
@@ -289,9 +289,7 @@ struct CodeRecord {
     /// the code worthless, including one approved by an attempt that was already queued.
     /// `None` when the person signed in upstream.
     owner_hash: Option<String>,
-    /// The revocation stamp the sign-in saw. The exchange refuses the code when its subject was
-    /// revoked after that.
-    stamp: u64,
+    flow: Flow,
     expires: Timestamp,
     seq: u64,
 }
@@ -335,7 +333,7 @@ fn insert_bounded<R: Expiring>(
 struct SignInRecord {
     request: AuthRequest,
     browser: String,
-    started_at: Timestamp,
+    flow: Flow,
     expires: Timestamp,
     seq: u64,
 }
@@ -355,7 +353,7 @@ struct ConsentRecord {
     request: AuthRequest,
     subject: Subject,
     browser: String,
-    stamp: u64,
+    flow: Flow,
     expires: Timestamp,
     seq: u64,
 }
@@ -370,6 +368,15 @@ impl Expiring for ConsentRecord {
     }
 }
 
+/// Where a flow began, from `GET /authorize` on. It travels unchanged through the pending
+/// sign-in, the consent ticket and the code, and the code exchange judges the flow by it.
+#[derive(Clone, Copy)]
+struct Flow {
+    /// The value of `PendingState::seq` when the flow began.
+    seq: u64,
+    started_at: Timestamp,
+}
+
 /// When a subject was last revoked: the `seq` the revocation took, and the time.
 struct Revocation {
     seq: u64,
@@ -379,7 +386,7 @@ struct Revocation {
 #[derive(Default)]
 struct PendingState {
     seq: u64,
-    /// Dropped by the next revocation once older than `REVOCATION_MEMORY`.
+    /// Dropped by the next revocation once older than `MAX_FLOW`.
     revocations: HashMap<String, Revocation>,
     csrf: HashMap<String, CsrfRecord>,
     codes: HashMap<String, CodeRecord>,
@@ -495,9 +502,26 @@ impl<St: GrantStore> OAuth<St> {
     /// Drops what is waiting in memory for this person: authorization codes that were issued
     /// and consent tickets that were shown. For a service that deletes the person's grants
     /// itself, such as through a foreign key in its own transaction.
+    ///
+    /// It also makes every flow that began before it unable to produce a usable code, so a
+    /// consent that is being saved at this moment ends in a refused exchange.
     pub fn forget_subject(&self, id: &str) {
+        let now = self.now();
         let mut pending = self.pending();
 
+        pending.seq += 1;
+
+        let revocation = Revocation {
+            seq: pending.seq,
+            at: now,
+        };
+
+        // A flow that began before a revocation is refused after its start plus MAX_FLOW, which
+        // is before the revocation plus MAX_FLOW, so an older entry has nothing left to refuse.
+        pending
+            .revocations
+            .retain(|_, existing| now < existing.at + MAX_FLOW);
+        pending.revocations.insert(id.to_string(), revocation);
         pending.codes.retain(|_, record| record.subject.id != id);
         pending.consents.retain(|_, record| record.subject.id != id);
     }
@@ -508,43 +532,32 @@ impl<St: GrantStore> OAuth<St> {
     /// It waits for a code exchange that is under way: an exchange has taken its code before it
     /// writes its tokens, so without the wait it could write them after the delete.
     ///
-    /// A sign-in that was already past the upstream when this ran may still issue a code, from
-    /// a consent write or lookup that was under way. The exchange refuses that code.
+    /// A flow that began before this ran can still issue a code, from a consent write or lookup
+    /// that was under way, or from a sign-in taken earlier. The exchange refuses that code.
     pub async fn revoke_subject(&self, id: &str) -> Result<(), StoreError> {
         let _exchanges = self.inner.grant_lock.lock().await;
-        let now = self.now();
-
-        {
-            let mut pending = self.pending();
-
-            pending.seq += 1;
-
-            let revocation = Revocation {
-                seq: pending.seq,
-                at: now,
-            };
-
-            pending
-                .revocations
-                .retain(|_, existing| now < existing.at + REVOCATION_MEMORY);
-            pending.revocations.insert(id.to_string(), revocation);
-        }
 
         self.forget_subject(id);
 
-        self.inner.store.revoke_subject(id, now).await
+        self.inner.store.revoke_subject(id, self.now()).await
     }
 
-    /// What a sign-in remembers about revocations when it starts.
-    fn revocation_stamp(&self) -> u64 {
-        self.pending().seq
+    /// The flow of a code issued right now, for sign-ins that need no upstream round trip.
+    fn flow_now(&self) -> Flow {
+        Flow {
+            seq: self.pending().seq,
+            started_at: self.now(),
+        }
     }
 
-    fn revoked_since(&self, id: &str, stamp: u64) -> bool {
-        self.pending()
-            .revocations
-            .get(id)
-            .is_some_and(|revocation| revocation.seq > stamp)
+    /// Whether a code of `flow` for `id` may no longer be exchanged.
+    fn flow_is_dead(&self, id: &str, flow: Flow) -> bool {
+        self.now() > flow.started_at + MAX_FLOW
+            || self
+                .pending()
+                .revocations
+                .get(id)
+                .is_some_and(|revocation| revocation.seq > flow.seq)
     }
 
     /// Checks a bearer access token against the store. A token issued for another resource

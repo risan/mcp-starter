@@ -9,8 +9,8 @@ use std::collections::HashMap;
 
 use super::register::{parse_loopback, redirect_matches};
 use super::{
-    CODE_TTL, CSRF_TTL, CodeRecord, CsrfRecord, GrantStore, LOCKOUT_FAILS, LOCKOUT_WINDOW, OAuth,
-    OFFLINE_ACCESS, SignIn, Subject, hash_token, insert_bounded, parse_pairs, random_token,
+    CODE_TTL, CSRF_TTL, CodeRecord, CsrfRecord, Flow, GrantStore, LOCKOUT_FAILS, LOCKOUT_WINDOW,
+    OAuth, OFFLINE_ACCESS, SignIn, Subject, hash_token, insert_bounded, parse_pairs, random_token,
 };
 use crate::store::Client;
 use crate::work::ConnPermit;
@@ -390,9 +390,9 @@ impl<St: GrantStore> OAuth<St> {
 
         self.pending().failures.clear();
 
-        let stamp = self.revocation_stamp();
+        let flow = self.flow_now();
 
-        Attempt::Granted(self.issue_code(request, Subject::owner(), Some(hash), stamp))
+        Attempt::Granted(self.issue_code(request, Subject::owner(), Some(hash), flow))
     }
 
     /// Keeps an authorization code for the request and returns it.
@@ -401,7 +401,7 @@ impl<St: GrantStore> OAuth<St> {
         request: AuthRequest,
         subject: Subject,
         owner_hash: Option<String>,
-        stamp: u64,
+        flow: Flow,
     ) -> String {
         let code = random_token(32);
         let now = self.now();
@@ -423,7 +423,7 @@ impl<St: GrantStore> OAuth<St> {
             resource,
             subject,
             owner_hash,
-            stamp,
+            flow,
             expires: now + CODE_TTL,
             seq: pending.seq,
         };

@@ -20,7 +20,7 @@ use super::authorize::{
     redirect_target, request_warning, security_policy,
 };
 use super::{
-    CSRF_TTL, ConsentRecord, GrantStore, OAuth, PasswordChecker, SignInRecord, Subject,
+    CSRF_TTL, ConsentRecord, Flow, GrantStore, OAuth, PasswordChecker, SignInRecord, Subject,
     constant_time_eq, hash_token, insert_bounded, parse_pairs, random_token,
 };
 use crate::store::Client;
@@ -52,13 +52,13 @@ pub enum SignIn {
 pub struct Pending {
     request: AuthRequest,
     browser: String,
-    started_at: Timestamp,
+    flow: Flow,
 }
 
 impl Pending {
     /// When the person's browser reached `GET /authorize`.
     pub fn started_at(&self) -> Timestamp {
-        self.started_at
+        self.flow.started_at
     }
 }
 
@@ -176,7 +176,10 @@ impl<St: GrantStore> OAuth<St> {
             let record = SignInRecord {
                 request,
                 browser: hash_token(&cookie),
-                started_at: now,
+                flow: Flow {
+                    seq: pending.seq,
+                    started_at: now,
+                },
                 expires: now + CSRF_TTL,
                 seq: pending.seq,
             };
@@ -224,7 +227,7 @@ impl<St: GrantStore> OAuth<St> {
         Ok(Pending {
             request: record.request,
             browser: record.browser,
-            started_at: record.started_at,
+            flow: record.flow,
         })
     }
 
@@ -248,7 +251,6 @@ impl<St: GrantStore> OAuth<St> {
                 "The sign-in could not be completed.",
             );
         };
-        let stamp = self.revocation_stamp();
         let client = match self.validate_target(&pending.request).await {
             Ok(client) => client,
             Err(problem) => return error_page(StatusCode::BAD_REQUEST, problem),
@@ -261,11 +263,11 @@ impl<St: GrantStore> OAuth<St> {
             .await
         {
             Ok(true) => {
-                let code = self.issue_code(pending.request.clone(), subject, None, stamp);
+                let code = self.issue_code(pending.request.clone(), subject, None, pending.flow);
 
                 grant_redirect(self, &pending.request, &code)
             }
-            Ok(false) => self.ask_consent(pending, &client, subject, stamp),
+            Ok(false) => self.ask_consent(pending, &client, subject),
             Err(_) => error_page(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "The sign-in could not be completed.",
@@ -273,13 +275,7 @@ impl<St: GrantStore> OAuth<St> {
         }
     }
 
-    fn ask_consent(
-        &self,
-        pending: Pending,
-        client: &Client,
-        subject: Subject,
-        stamp: u64,
-    ) -> Response {
+    fn ask_consent(&self, pending: Pending, client: &Client, subject: Subject) -> Response {
         let ticket = random_token(32);
         let now = self.now();
         let (target, host) = redirect_target(&pending.request.redirect_uri);
@@ -314,7 +310,7 @@ impl<St: GrantStore> OAuth<St> {
                 request: pending.request,
                 subject,
                 browser: pending.browser,
-                stamp,
+                flow: pending.flow,
                 expires: now + CSRF_TTL,
                 seq: state.seq,
             };
@@ -413,7 +409,7 @@ impl<St: GrantStore> OAuth<St> {
             );
         }
 
-        let code = self.issue_code(record.request.clone(), record.subject, None, record.stamp);
+        let code = self.issue_code(record.request.clone(), record.subject, None, record.flow);
 
         grant_redirect(self, &record.request, &code)
     }

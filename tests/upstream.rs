@@ -860,6 +860,7 @@ struct GatedRig {
     oauth: mcp_starter::oauth::OAuth<GatedStore<mcp_starter::store::Store<support::TestState>>>,
     client: OAuthClient,
     client_id: String,
+    clock: mcp_starter::test_support::TestClock,
     armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     entered: std::sync::Arc<tokio::sync::Notify>,
     release: std::sync::Arc<tokio::sync::Semaphore>,
@@ -890,11 +891,12 @@ impl GatedRig {
             entered: entered.clone(),
             release: release.clone(),
         };
+        let clock = TestClock::new("2026-10-24T09:00:00Z");
         let oauth = OAuth::new(
             &support::INFO,
             gated,
             ISSUER,
-            TestClock::new("2026-10-24T09:00:00Z").as_clock(),
+            clock.as_clock(),
             SignIn::Upstream(Arc::new(TestUpstream)),
             Work::new(TaskTracker::new()),
         );
@@ -913,6 +915,7 @@ impl GatedRig {
             oauth,
             client,
             client_id,
+            clock,
             armed,
             entered,
             release,
@@ -924,12 +927,17 @@ impl GatedRig {
         self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Waits until the flow is stopped inside the store, runs `revoke_subject` for Pat, then
-    /// lets the flow go.
-    async fn revoke_pat_while_paused(&self) {
+    /// Waits until the flow is stopped inside the store.
+    async fn paused(&self) {
         self.entered.notified().await;
-        self.oauth.revoke_subject(PAT.0).await.unwrap();
+    }
+
+    fn resume(&self) {
         self.release.add_permits(1);
+    }
+
+    fn advance(&self, seconds: f64) {
+        self.clock.advance(SignedDuration::from_secs_f64(seconds));
     }
 
     /// Exchanges `code` and asserts that nothing came of it.
@@ -1013,7 +1021,9 @@ async fn a_revocation_during_the_consent_write_leaves_no_usable_code() {
         tokio::spawn(async move { client.decide(&ticket, "allow", Some(&cookie)).await })
     };
 
-    rig.revoke_pat_while_paused().await;
+    rig.paused().await;
+    rig.oauth.revoke_subject(PAT.0).await.unwrap();
+    rig.resume();
 
     let allowed = deciding.await.unwrap();
 
@@ -1044,7 +1054,9 @@ async fn a_revocation_during_the_consent_lookup_leaves_no_usable_code() {
         })
     };
 
-    rig.revoke_pat_while_paused().await;
+    rig.paused().await;
+    rig.oauth.revoke_subject(PAT.0).await.unwrap();
+    rig.resume();
 
     let (_, back) = signing_in.await.unwrap();
 
@@ -1081,4 +1093,114 @@ async fn a_code_issued_after_a_revocation_still_works() {
             .await
             .is_ok()
     );
+}
+
+#[tokio::test]
+async fn a_forgotten_subject_during_the_consent_write_leaves_no_usable_code() {
+    let rig = GatedRig::new(Stop::SaveConsent).await;
+    let (cookie, page) = rig
+        .client
+        .sign_in(&rig.client_id, CLAUDE_CALLBACK, PAT.0, PAT.1)
+        .await;
+    let ticket = OAuthClient::consent_ticket(&page).unwrap();
+
+    rig.arm();
+
+    let deciding = {
+        let client = rig.client.clone();
+
+        tokio::spawn(async move { client.decide(&ticket, "allow", Some(&cookie)).await })
+    };
+
+    rig.paused().await;
+    rig.oauth.forget_subject(PAT.0);
+    rig.resume();
+
+    let allowed = deciding.await.unwrap();
+
+    rig.assert_code_is_dead(&allowed.location_param("code").unwrap())
+        .await;
+}
+
+#[tokio::test]
+async fn a_sign_in_taken_before_a_revocation_cannot_finish_after_it() {
+    let rig = support::upstream_rig().await;
+    let client_id = registered(&rig).await;
+
+    rig.client
+        .upstream_grant(&client_id, CLAUDE_CALLBACK, PAT.0, PAT.1)
+        .await;
+
+    let (pending_id, cookie) = rig
+        .client
+        .start_sign_in(&client_id, CLAUDE_CALLBACK, None)
+        .await;
+    let pending = rig
+        .oauth
+        .take_pending(&cookie_header(&cookie), &pending_id)
+        .unwrap();
+
+    rig.oauth.revoke_subject(PAT.0).await.unwrap();
+
+    let response = rig
+        .oauth
+        .complete(
+            pending,
+            Subject {
+                id: PAT.0.to_string(),
+                name: PAT.1.to_string(),
+            },
+        )
+        .await;
+    let location = response.headers()["location"].to_str().unwrap().to_string();
+    let code = reqwest::Url::parse(&location)
+        .unwrap()
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .map(|(_, value)| value.into_owned())
+        .unwrap();
+    let (reply, tokens) = rig
+        .client
+        .exchange(&client_id, CLAUDE_CALLBACK, &code, VERIFIER)
+        .await;
+
+    assert_eq!(reply.error_code(), "invalid_grant", "{}", reply.body);
+    assert!(tokens.is_none());
+}
+
+#[tokio::test]
+async fn a_flow_older_than_fifteen_minutes_is_refused_after_its_revocation_was_forgotten() {
+    let rig = GatedRig::new(Stop::HasConsent).await;
+
+    rig.arm();
+
+    let signing_in = {
+        let client = rig.client.clone();
+        let client_id = rig.client_id.clone();
+
+        tokio::spawn(async move {
+            client
+                .sign_in(&client_id, CLAUDE_CALLBACK, PAT.0, PAT.1)
+                .await
+        })
+    };
+
+    rig.paused().await;
+    rig.oauth.revoke_subject(PAT.0).await.unwrap();
+    rig.advance(2.0);
+    rig.resume();
+
+    let (cookie, page) = signing_in.await.unwrap();
+    let ticket = OAuthClient::consent_ticket(&page).unwrap();
+
+    rig.advance(599.0);
+
+    let allowed = rig.client.decide(&ticket, "allow", Some(&cookie)).await;
+    let code = allowed.location_param("code").unwrap();
+
+    // 900.5 s after the sign-in began: the code lives until 901 s, Pat's revocation is older
+    // than fifteen minutes and goes when Sam's is recorded. Only the flow's age refuses it.
+    rig.advance(299.5);
+    rig.oauth.revoke_subject(SAM.0).await.unwrap();
+    rig.assert_code_is_dead(&code).await;
 }

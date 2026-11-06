@@ -135,6 +135,10 @@ pub struct Client {
     /// When a token was last issued to the client.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<Timestamp>,
+    /// The ids of the people who approved this client on the consent page. A single-owner
+    /// server never fills it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consented_subjects: Vec<String>,
     /// Fields this crate does not know, kept as they are.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -165,6 +169,13 @@ pub struct Token {
     /// The MCP resource URL the token is bound to.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub resource: String,
+    /// The id of the person the grant belongs to; empty for the owner of a single-owner
+    /// server.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub subject: String,
+    /// The display name of that person; empty for the owner.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub subject_name: String,
     /// When the token stops working.
     pub expires_at: Timestamp,
     /// A used refresh token kept only to detect replay.
@@ -781,6 +792,34 @@ mod tests {
     };
 
     #[test]
+    fn a_token_with_a_subject_round_trips_and_an_empty_one_is_omitted() {
+        let token = |subject: &str, subject_name: &str| Token {
+            kind: TokenKind::Access,
+            client_id: "c1".into(),
+            family: "f1".into(),
+            scope: String::new(),
+            resource: String::new(),
+            subject: subject.into(),
+            subject_name: subject_name.into(),
+            expires_at: "2099-01-01T00:00:00Z".parse().unwrap(),
+            rotated: false,
+            extra: Map::new(),
+        };
+        let named = token("42", "Pat Jones");
+        let json = serde_json::to_string(&named).unwrap();
+
+        assert!(json.contains(r#""subject":"42""#), "{json}");
+        assert!(json.contains(r#""subject_name":"Pat Jones""#), "{json}");
+        assert_eq!(serde_json::from_str::<Token>(&json).unwrap(), named);
+
+        let owner = token("", "");
+        let json = serde_json::to_string(&owner).unwrap();
+
+        assert!(!json.contains("subject"), "{json}");
+        assert_eq!(serde_json::from_str::<Token>(&json).unwrap(), owner);
+    }
+
+    #[test]
     fn duplicate_top_level_fields_are_refused() {
         for json in [
             r#"{"test":{"rev":12},"test":{}}"#,
@@ -1157,6 +1196,7 @@ mod tests {
                         redirect_uris: vec!["https://claude.ai/api/mcp/auth_callback".into()],
                         registered_at: registered,
                         last_used_at: None,
+                        consented_subjects: Vec::new(),
                         extra: Map::new(),
                     },
                 );
@@ -1168,6 +1208,8 @@ mod tests {
                         family: "f1".into(),
                         scope: "test".into(),
                         resource: String::new(),
+                        subject: String::new(),
+                        subject_name: String::new(),
                         expires_at: registered,
                         rotated: true,
                         extra: Map::new(),
@@ -1696,6 +1738,7 @@ mod tests {
                 redirect_uris: Vec::new(),
                 registered_at: registered,
                 last_used_at: None,
+                consented_subjects: Vec::new(),
                 extra: Map::new(),
             },
         );
@@ -1707,6 +1750,8 @@ mod tests {
                 family: "f1".into(),
                 scope: String::new(),
                 resource: String::new(),
+                subject: String::new(),
+                subject_name: String::new(),
                 expires_at: registered,
                 rotated: false,
                 extra: Map::new(),

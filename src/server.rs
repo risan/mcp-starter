@@ -26,8 +26,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::ServiceInfo;
-use crate::oauth::{OAuth, VerifyError};
-use crate::store::Section;
+use crate::oauth::{GrantStore, OAuth, VerifyError};
 use crate::work::{ConnPermit, Work};
 
 const MCP_BODY_LIMIT: usize = 1 << 20;
@@ -84,14 +83,14 @@ where
 /// Every route behind its body layer: `/healthz`, the favicon, the home page (when set), the OAuth
 /// routes, the protected-resource metadata and `/mcp`. `/mcp` checks the bearer first, so an
 /// anonymous caller never makes the server buffer a body.
-pub fn build_router<S, H>(
+pub fn build_router<St, H>(
     info: &'static ServiceInfo,
-    oauth: OAuth<S>,
+    oauth: OAuth<St>,
     work: Arc<Work>,
     mcp: StreamableHttpService<H, NeverSessionManager>,
 ) -> Router
 where
-    S: Section,
+    St: GrantStore,
     H: ServerHandler + Send + 'static,
 {
     build_router_with(info, oauth, work, mcp, Router::new())
@@ -101,15 +100,15 @@ where
 /// and sit outside the 64 KiB OAuth body layer, so they get no body cap unless they add
 /// [`buffer_body`] themselves. A path the built-in routes already use makes axum panic when
 /// the router is built.
-pub fn build_router_with<S, H>(
+pub fn build_router_with<St, H>(
     info: &'static ServiceInfo,
-    oauth: OAuth<S>,
+    oauth: OAuth<St>,
     work: Arc<Work>,
     mcp: StreamableHttpService<H, NeverSessionManager>,
     routes: Router,
 ) -> Router
 where
-    S: Section,
+    St: GrantStore,
     H: ServerHandler + Send + 'static,
 {
     let public_url = oauth.issuer().to_string();
@@ -193,14 +192,14 @@ async fn log_request(request: Request, next: Next) -> Response {
     response
 }
 
-struct BearerState<S> {
-    oauth: OAuth<S>,
+struct BearerState<St> {
+    oauth: OAuth<St>,
     work: Arc<Work>,
     metadata_url: String,
 }
 
-impl<S> Clone for BearerState<S> {
-    fn clone(&self) -> BearerState<S> {
+impl<St> Clone for BearerState<St> {
+    fn clone(&self) -> BearerState<St> {
         BearerState {
             oauth: self.oauth.clone(),
             work: self.work.clone(),
@@ -211,10 +210,10 @@ impl<S> Clone for BearerState<S> {
 
 /// Our own middleware because it must emit `error="invalid_token"` when a token was sent
 /// and check expiry against the injectable clock.
-async fn require_bearer<S: Section>(
-    State(state): State<BearerState<S>>,
+async fn require_bearer<St: GrantStore>(
+    State(state): State<BearerState<St>>,
     permit: ConnPermit,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let challenge = |with_error: bool| {
@@ -258,7 +257,11 @@ async fn require_bearer<S: Section>(
     };
 
     match verified {
-        Ok(_) => next.run(request).await,
+        Ok(info) => {
+            request.extensions_mut().insert(info);
+
+            next.run(request).await
+        }
         Err(VerifyError::Invalid) => unauthorized(true, "invalid or expired token"),
         Err(VerifyError::Store(error)) => {
             eprintln!("bearer check: {error}");

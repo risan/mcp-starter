@@ -138,6 +138,7 @@ fn client(id: &str) -> Client {
         redirect_uris: Vec::new(),
         registered_at: "2026-10-24T00:00:00Z".parse().unwrap(),
         last_used_at: None,
+        consented_subjects: Vec::new(),
         extra: Default::default(),
     }
 }
@@ -149,6 +150,8 @@ fn token(kind: TokenKind, expires_at: &str, rotated: bool) -> Token {
         family: String::new(),
         scope: String::new(),
         resource: String::new(),
+        subject: String::new(),
+        subject_name: String::new(),
         expires_at: expires_at.parse().unwrap(),
         rotated,
         extra: Default::default(),

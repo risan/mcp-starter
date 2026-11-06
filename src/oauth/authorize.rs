@@ -1,6 +1,6 @@
 use axum::body::Bytes;
 use axum::extract::{Query, State};
-use axum::http::{HeaderName, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use jiff::SignedDuration;
 use reqwest::Url;
@@ -9,10 +9,10 @@ use std::collections::HashMap;
 
 use super::register::{parse_loopback, redirect_matches};
 use super::{
-    CODE_TTL, CSRF_TTL, CodeRecord, CsrfRecord, LOCKOUT_FAILS, LOCKOUT_WINDOW, OAuth,
-    OFFLINE_ACCESS, hash_token, insert_bounded, parse_pairs, random_token,
+    CODE_TTL, CSRF_TTL, CodeRecord, CsrfRecord, GrantStore, LOCKOUT_FAILS, LOCKOUT_WINDOW, OAuth,
+    OFFLINE_ACCESS, SignIn, Subject, hash_token, insert_bounded, parse_pairs, random_token,
 };
-use crate::store::{Client, Section};
+use crate::store::Client;
 use crate::work::ConnPermit;
 
 /// The parameters the consent page carries from `GET /authorize` to `POST /authorize`.
@@ -29,7 +29,7 @@ pub(super) struct AuthRequest {
 }
 
 impl AuthRequest {
-    fn from_fields(fields: &HashMap<String, String>) -> AuthRequest {
+    pub(super) fn from_fields(fields: &HashMap<String, String>) -> AuthRequest {
         let get = |name: &str| fields.get(name).cloned().unwrap_or_default();
 
         AuthRequest {
@@ -57,6 +57,11 @@ impl AuthRequest {
         ]
     }
 
+    /// The bytes of all the fields together.
+    pub(super) fn size(&self) -> usize {
+        self.fields().iter().map(|(_, value)| value.len()).sum()
+    }
+
     /// The constant-size fingerprint a CSRF record keeps instead of the parameters.
     fn hash(&self) -> String {
         let encoded = serde_json::to_string(&self.fields()).unwrap_or_default();
@@ -69,7 +74,8 @@ impl AuthRequest {
 }
 
 enum CsrfCheck {
-    Valid,
+    /// The `seq` the page was shown at, where the flow began.
+    Valid(u64),
     Expired,
     Altered,
 }
@@ -81,7 +87,7 @@ enum Attempt {
     Granted(String),
 }
 
-fn escape_html(text: &str) -> String {
+pub(super) fn escape_html(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
 
     for c in text.chars() {
@@ -98,7 +104,7 @@ fn escape_html(text: &str) -> String {
     escaped
 }
 
-fn page_head(display_name: &str) -> String {
+pub(super) fn page_head(display_name: &str) -> String {
     let title = escape_html(&format!("Connect to {display_name}"));
 
     format!(
@@ -112,7 +118,7 @@ fn page_head(display_name: &str) -> String {
     )
 }
 
-fn page(status: StatusCode, html: String, content_security_policy: &str) -> Response {
+pub(super) fn page(status: StatusCode, html: String, content_security_policy: &str) -> Response {
     let mut response = (status, html).into_response();
     let headers = response.headers_mut();
 
@@ -136,7 +142,7 @@ fn page(status: StatusCode, html: String, content_security_policy: &str) -> Resp
 
 const DEFAULT_POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'";
 
-fn error_page(status: StatusCode, message: &str) -> Response {
+pub(super) fn error_page(status: StatusCode, message: &str) -> Response {
     page(
         status,
         format!(
@@ -150,20 +156,54 @@ fn error_page(status: StatusCode, message: &str) -> Response {
     )
 }
 
-impl<S: Section> OAuth<S> {
+/// The redirect URI as a URL and its `host[:port]`, empty when it does not parse.
+pub(super) fn redirect_target(redirect_uri: &str) -> (Option<Url>, String) {
+    let target = Url::parse(redirect_uri).ok();
+    let host = target
+        .as_ref()
+        .and_then(|url| {
+            let host = url.host_str()?;
+
+            Some(match url.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_string(),
+            })
+        })
+        .unwrap_or_default();
+
+    (target, host)
+}
+
+/// The content security policy of a page whose form ends in a redirect to the client.
+pub(super) fn security_policy(target: Option<&Url>, redirect_host: &str) -> String {
+    match target {
+        Some(url) => format!("{DEFAULT_POLICY} {}://{redirect_host}", url.scheme()),
+        None => DEFAULT_POLICY.to_string(),
+    }
+}
+
+/// Registration is open, so anyone with a Claude or ChatGPT account can register a client and
+/// send a person a link to the consent page.
+pub(super) fn request_warning(redirect_uri: &str) -> String {
+    if parse_loopback(redirect_uri).is_some() {
+        "<p class=\"warn\">This is a loopback address (a program on the same machine as your browser). Continue only if you started this connection yourself.</p>".to_string()
+    } else {
+        "<p class=\"warn\">Approve only a connection you started yourself just now. Anyone can register an application here and send you a link to this page.</p>".to_string()
+    }
+}
+
+impl<St: GrantStore> OAuth<St> {
     async fn find_client(&self, id: &str) -> Option<Client> {
         let id = id.to_string();
 
-        self.inner
-            .store
-            .read(move |state| state.clients.get(&id).cloned())
-            .await
-            .ok()
-            .flatten()
+        self.inner.store.find_client(&id).await.ok().flatten()
     }
 
     /// Checks the client and redirect URI. A failure never redirects.
-    async fn validate_target(&self, request: &AuthRequest) -> Result<Client, &'static str> {
+    pub(super) async fn validate_target(
+        &self,
+        request: &AuthRequest,
+    ) -> Result<Client, &'static str> {
         let Some(client) = self.find_client(&request.client_id).await else {
             return Err(
                 "This connection request names an unknown client. Start the connection again from Claude.",
@@ -181,8 +221,50 @@ impl<S: Section> OAuth<S> {
         Ok(client)
     }
 
-    fn redirect_with_error(
+    /// The checks every authorization request passes, whoever signs the person in. A failure
+    /// is the answer to send.
+    pub(super) async fn check_request(
         &self,
+        request: &AuthRequest,
+    ) -> Result<Client, Box<Response>> {
+        let client = match self.validate_target(request).await {
+            Ok(client) => client,
+            Err(problem) => return Err(Box::new(error_page(StatusCode::BAD_REQUEST, problem))),
+        };
+
+        if request.response_type != "code" {
+            return Err(Box::new(self.redirect_with_error(
+                StatusCode::FOUND,
+                request,
+                "unsupported_response_type",
+                "only response_type=code is supported",
+            )));
+        }
+
+        if request.code_challenge.is_empty() || request.method != "S256" {
+            return Err(Box::new(self.redirect_with_error(
+                StatusCode::FOUND,
+                request,
+                "invalid_request",
+                "code_challenge with code_challenge_method=S256 is required",
+            )));
+        }
+
+        if !request.resource.is_empty() && request.resource != self.inner.resource {
+            return Err(Box::new(self.redirect_with_error(
+                StatusCode::FOUND,
+                request,
+                "invalid_target",
+                "unknown resource",
+            )));
+        }
+
+        Ok(client)
+    }
+
+    pub(super) fn redirect_with_error(
+        &self,
+        status: StatusCode,
         request: &AuthRequest,
         code: &str,
         description: &str,
@@ -207,7 +289,7 @@ impl<S: Section> OAuth<S> {
             query.append_pair("iss", &self.inner.issuer);
         }
 
-        redirect(StatusCode::FOUND, target.as_str())
+        redirect(status, target.as_str())
     }
 
     fn issue_csrf(&self, request: &AuthRequest) -> String {
@@ -220,6 +302,7 @@ impl<S: Section> OAuth<S> {
         let record = CsrfRecord {
             expires: now + CSRF_TTL,
             params_hash: request.hash(),
+            start_seq: pending.seq,
             seq: pending.seq,
         };
 
@@ -240,7 +323,7 @@ impl<S: Section> OAuth<S> {
         match record {
             Some(record) if now < record.expires => {
                 if record.params_hash == request.hash() {
-                    CsrfCheck::Valid
+                    CsrfCheck::Valid(record.start_seq)
                 } else {
                     CsrfCheck::Altered
                 }
@@ -285,6 +368,7 @@ impl<S: Section> OAuth<S> {
         hash: String,
         password: String,
         request: AuthRequest,
+        start_seq: u64,
     ) -> Attempt {
         let _attempt = self.inner.password_lock.lock().await;
 
@@ -292,7 +376,10 @@ impl<S: Section> OAuth<S> {
             return Attempt::Locked(remaining);
         }
 
-        let checker = self.inner.checker.clone();
+        let SignIn::Password(checker) = &self.inner.sign_in else {
+            return Attempt::Wrong;
+        };
+        let checker = checker.clone();
         let checked_hash = hash.clone();
         let matches = tokio::task::spawn_blocking(move || checker(&checked_hash, &password))
             .await
@@ -304,6 +391,19 @@ impl<S: Section> OAuth<S> {
             return Attempt::Wrong;
         }
 
+        self.pending().failures.clear();
+
+        Attempt::Granted(self.issue_code(request, Subject::owner(), Some(hash), start_seq))
+    }
+
+    /// Keeps an authorization code for the request and returns it.
+    pub(super) fn issue_code(
+        &self,
+        request: AuthRequest,
+        subject: Subject,
+        owner_hash: Option<String>,
+        start_seq: u64,
+    ) -> String {
         let code = random_token(32);
         let now = self.now();
         let scope = granted_scope(self.inner.info.scope, &request.scope);
@@ -314,7 +414,6 @@ impl<S: Section> OAuth<S> {
         };
         let mut pending = self.pending();
 
-        pending.failures.clear();
         pending.seq += 1;
 
         let record = CodeRecord {
@@ -323,14 +422,16 @@ impl<S: Section> OAuth<S> {
             challenge: request.code_challenge,
             scope,
             resource,
-            owner_hash: hash,
+            subject,
+            owner_hash,
+            start_seq,
             expires: now + CODE_TTL,
             seq: pending.seq,
         };
 
         insert_bounded(&mut pending.codes, hash_token(&code), record, now);
 
-        Attempt::Granted(code)
+        code
     }
 
     fn consent_page(
@@ -341,18 +442,7 @@ impl<S: Section> OAuth<S> {
         message: &str,
         show_form: bool,
     ) -> Response {
-        let target = Url::parse(&request.redirect_uri).ok();
-        let redirect_host = target
-            .as_ref()
-            .and_then(|url| {
-                let host = url.host_str()?;
-
-                Some(match url.port() {
-                    Some(port) => format!("{host}:{port}"),
-                    None => host.to_string(),
-                })
-            })
-            .unwrap_or_default();
+        let (target, redirect_host) = redirect_target(&request.redirect_uri);
         let name = if client.client_name.is_empty() {
             "An application"
         } else {
@@ -370,13 +460,8 @@ impl<S: Section> OAuth<S> {
             escape_html(&client.client_id)
         ));
 
-        // Registration is open, so anyone with a Claude or ChatGPT account can register a client
-        // and send the owner a link to this page.
-        if parse_loopback(&request.redirect_uri).is_some() {
-            html.push_str("<p class=\"warn\">This is a loopback address (a program on the same machine as your browser). Continue only if you started this connection yourself.</p>\n");
-        } else {
-            html.push_str("<p class=\"warn\">Approve only a connection you started yourself just now. Anyone can register an application here and send you a link to this page.</p>\n");
-        }
+        html.push_str(&request_warning(&request.redirect_uri));
+        html.push('\n');
 
         if !message.is_empty() {
             html.push_str(&format!("<p class=\"err\">{}</p>\n", escape_html(message)));
@@ -401,16 +486,13 @@ impl<S: Section> OAuth<S> {
 
         html.push_str("</body></html>");
 
-        let policy = match &target {
-            Some(url) => format!("{DEFAULT_POLICY} {}://{redirect_host}", url.scheme()),
-            None => DEFAULT_POLICY.to_string(),
-        };
+        let policy = security_policy(target.as_ref(), &redirect_host);
 
         page(status, html, &policy)
     }
 }
 
-fn redirect(status: StatusCode, location: &str) -> Response {
+pub(super) fn redirect(status: StatusCode, location: &str) -> Response {
     let mut response = status.into_response();
 
     if let Ok(location) = HeaderValue::from_str(location) {
@@ -437,14 +519,18 @@ fn granted_scope(service_scope: &str, requested: &str) -> String {
     granted.join(" ")
 }
 
-pub(super) async fn authorize_get<S: Section>(
-    State(oauth): State<OAuth<S>>,
+pub(super) async fn authorize_get<St: GrantStore>(
+    State(oauth): State<OAuth<St>>,
     permit: ConnPermit,
+    headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let work = oauth.inner.work.clone();
 
-    match work.run_detached(permit, show_consent(oauth, query)).await {
+    match work
+        .run_detached(permit, show_consent(oauth, headers, query))
+        .await
+    {
         Ok(response) => response,
         Err(shutting_down) => {
             error_page(StatusCode::SERVICE_UNAVAILABLE, &shutting_down.to_string())
@@ -452,44 +538,36 @@ pub(super) async fn authorize_get<S: Section>(
     }
 }
 
-async fn show_consent<S: Section>(oauth: OAuth<S>, query: HashMap<String, String>) -> Response {
+async fn show_consent<St: GrantStore>(
+    oauth: OAuth<St>,
+    headers: HeaderMap,
+    query: HashMap<String, String>,
+) -> Response {
+    if oauth.is_upstream() {
+        return oauth.begin_sign_in(&headers, &query).await;
+    }
+
     let request = AuthRequest::from_fields(&query);
-    let client = match oauth.validate_target(&request).await {
+    let client = match oauth.check_request(&request).await {
         Ok(client) => client,
-        Err(problem) => return error_page(StatusCode::BAD_REQUEST, problem),
+        Err(response) => return *response,
     };
-
-    if request.response_type != "code" {
-        return oauth.redirect_with_error(
-            &request,
-            "unsupported_response_type",
-            "only response_type=code is supported",
-        );
-    }
-
-    if request.code_challenge.is_empty() || request.method != "S256" {
-        return oauth.redirect_with_error(
-            &request,
-            "invalid_request",
-            "code_challenge with code_challenge_method=S256 is required",
-        );
-    }
-
-    if !request.resource.is_empty() && request.resource != oauth.inner.resource {
-        return oauth.redirect_with_error(&request, "invalid_target", "unknown resource");
-    }
 
     oauth.consent_page(StatusCode::OK, &request, &client, "", true)
 }
 
-pub(super) async fn authorize_post<S: Section>(
-    State(oauth): State<OAuth<S>>,
+pub(super) async fn authorize_post<St: GrantStore>(
+    State(oauth): State<OAuth<St>>,
     permit: ConnPermit,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let work = oauth.inner.work.clone();
 
-    match work.run_detached(permit, approve(oauth, body)).await {
+    match work
+        .run_detached(permit, approve(oauth, headers, body))
+        .await
+    {
         Ok(response) => response,
         Err(shutting_down) => {
             error_page(StatusCode::SERVICE_UNAVAILABLE, &shutting_down.to_string())
@@ -497,12 +575,16 @@ pub(super) async fn authorize_post<S: Section>(
     }
 }
 
-async fn approve<S: Section>(oauth: OAuth<S>, body: Bytes) -> Response {
+async fn approve<St: GrantStore>(oauth: OAuth<St>, headers: HeaderMap, body: Bytes) -> Response {
+    if oauth.is_upstream() {
+        return oauth.decide_consent(&headers, &body).await;
+    }
+
     let fields = parse_pairs(&body);
     let request = AuthRequest::from_fields(&fields);
 
-    match oauth.take_csrf(fields.get("csrf").map_or("", String::as_str), &request) {
-        CsrfCheck::Valid => {}
+    let start_seq = match oauth.take_csrf(fields.get("csrf").map_or("", String::as_str), &request) {
+        CsrfCheck::Valid(start_seq) => start_seq,
         CsrfCheck::Expired => {
             return error_page(
                 StatusCode::BAD_REQUEST,
@@ -515,7 +597,7 @@ async fn approve<S: Section>(oauth: OAuth<S>, body: Bytes) -> Response {
                 "The form does not match the page that was shown. Start the connection again from Claude.",
             );
         }
-    }
+    };
 
     let client = match oauth.validate_target(&request).await {
         Ok(client) => client,
@@ -524,7 +606,7 @@ async fn approve<S: Section>(oauth: OAuth<S>, body: Bytes) -> Response {
     let hash = oauth
         .inner
         .store
-        .read(|state| state.owner.password_hash.clone())
+        .owner_password_hash()
         .await
         .unwrap_or_default();
 
@@ -544,7 +626,7 @@ async fn approve<S: Section>(oauth: OAuth<S>, body: Bytes) -> Response {
     let password = fields.get("password").cloned().unwrap_or_default();
     let attempt = oauth
         .clone()
-        .attempt_password(hash, password, request.clone())
+        .attempt_password(hash, password, request.clone(), start_seq)
         .await;
 
     match attempt {
@@ -566,7 +648,11 @@ async fn approve<S: Section>(oauth: OAuth<S>, body: Bytes) -> Response {
     }
 }
 
-fn grant_redirect<S: Section>(oauth: &OAuth<S>, request: &AuthRequest, code: &str) -> Response {
+pub(super) fn grant_redirect<St: GrantStore>(
+    oauth: &OAuth<St>,
+    request: &AuthRequest,
+    code: &str,
+) -> Response {
     let Ok(mut target) = Url::parse(&request.redirect_uri) else {
         return error_page(
             StatusCode::BAD_REQUEST,

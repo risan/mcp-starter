@@ -15,7 +15,7 @@ use super::TestClock;
 use super::jsonrpc::McpClient;
 use super::oauth_flow::{CLAUDE_CALLBACK, OAuthClient, OWNER_PASSWORD, Probe, VERIFIER};
 use crate::config::Config;
-use crate::oauth::OAuth;
+use crate::oauth::{OAuth, SignIn};
 use crate::server::{ServerOptions, build_router_with, mcp_service, serve};
 use crate::store::{Change, Section, State, Store, StoreOptions};
 use crate::work::Work;
@@ -128,7 +128,7 @@ impl<S: Section> ServerRig<S> {
             store.clone(),
             &setup.public_url,
             clock.as_clock(),
-            probe.checker(),
+            SignIn::Password(probe.checker()),
             work.clone(),
         );
         let context = RigContext {

@@ -1,9 +1,9 @@
 [package]
 name = "mcp-starter"
-version = "0.1.5"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.99"
-description = "Building blocks for a single-owner MCP server: OAuth, state file, HTTP server, tool helpers"
+description = "Building blocks for an MCP server: OAuth for one owner or many people, a state file or Postgres, HTTP server, tool helpers"
 license = "MIT"
 repository = "https://github.com/risan/mcp-starter"
 readme = "README.md"
@@ -20,6 +20,8 @@ name = "mcp_starter"
 path = "src/lib.rs"
 
 [features]
+# The Postgres grant store, for a service that signs many people in.
+postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls"]
 # Rigs, clocks and a test TLS chain for the tests of a service built on this crate.
 test-support = ["dep:tempfile", "dep:tokio-rustls", "axum/tokio"]
 
@@ -49,6 +51,8 @@ tokio-util = { version = "0.7.20", features = ["rt"] }
 tracing = { version = "0.1.44", features = ["release_max_level_off"] }
 tempfile = { version = "3.27.0", optional = true }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"], optional = true }
+tokio-postgres = { version = "0.7.18", optional = true }
+tokio-postgres-rustls = { version = "0.14.0", optional = true }
 
 [dev-dependencies]
 http-body = "1.1.0"

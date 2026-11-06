@@ -10,7 +10,8 @@ use mcp_starter::cli::{self, Getenv, Io, Outcome, Serving};
 use mcp_starter::config::Config;
 use mcp_starter::store::{Change, Lease, Section, Store, StoreOptions};
 use mcp_starter::tools::{
-    ToolOutcome, call_tool, date_or_today, error_result, request_permit, run_tool,
+    ToolOutcome, call_tool, date_or_today, error_result, request_permit, request_token, run_tool,
+    success_result,
 };
 use mcp_starter::work::{ConnPermit, Work};
 use mcp_starter::{Clock, ServiceInfo, system_clock};
@@ -61,6 +62,7 @@ pub struct App {
 
 const DESCRIPTION_ECHO: &str = "Echo the text back with the date it was asked for (default today).";
 const DESCRIPTION_COUNT: &str = "Add one to a counter kept in the state file and return it.";
+const DESCRIPTION_WHOAMI: &str = "Say who the signed-in caller is.";
 const DESCRIPTION_WAIT: &str = "Wait for the given number of milliseconds (0 to 30000), to show a tool that outlives its caller.";
 const MAX_WAIT_MILLISECONDS: u64 = 30_000;
 
@@ -157,6 +159,22 @@ impl ExampleTools {
             },
         )
         .await
+    }
+
+    #[tool(
+        name = "example_whoami",
+        description = DESCRIPTION_WHOAMI,
+        annotations(title = "Who am I", read_only_hint = true, idempotent_hint = true)
+    )]
+    async fn whoami(&self, context: RequestContext<RoleServer>) -> CallToolResult {
+        let Some(info) = request_token(&context) else {
+            return error_result("Not signed in.".to_string());
+        };
+
+        success_result(
+            format!("You are {}.", info.subject.name),
+            json!({"subject": info.subject.id, "name": info.subject.name}),
+        )
     }
 
     #[tool(

@@ -33,6 +33,27 @@ fn readme_covers_k7() {
             "## License",
             "MIT",
             "mfp-mcp-rs",
+            "## Many people",
+            "postgres",
+            "SignIn::Upstream",
+            "revoke_subject",
+        ],
+    );
+}
+
+#[test]
+fn changelog_explains_the_upgrade() {
+    let changelog = read("CHANGELOG.md");
+
+    assert_mentions(
+        &changelog,
+        "CHANGELOG.md",
+        &[
+            "## 0.2.0",
+            "SignIn::Password",
+            "OAuth<Store<",
+            "TokenInfo",
+            "subject",
         ],
     );
 }

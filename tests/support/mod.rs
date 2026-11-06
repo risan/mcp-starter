@@ -9,6 +9,10 @@ use mcp_starter::test_support::oauth_flow::OAuthRig;
 use mcp_starter::test_support::server_rig::{RigSetup, ServerRig};
 use std::sync::Arc;
 
+pub mod grant_store;
+#[cfg(feature = "postgres")]
+pub mod postgres;
+
 #[path = "../../examples/minimal/service.rs"]
 pub mod example;
 
@@ -18,6 +22,10 @@ pub type TestState = ExampleState;
 
 pub async fn rig() -> OAuthRig<ExampleState> {
     OAuthRig::start(&INFO).await
+}
+
+pub async fn upstream_rig() -> OAuthRig<ExampleState> {
+    OAuthRig::start_upstream(&INFO).await
 }
 
 pub async fn rig_with(options: StoreOptions) -> OAuthRig<ExampleState> {

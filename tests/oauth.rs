@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use jiff::SignedDuration;
-use mcp_starter::oauth::{revoke_all, set_password};
-use mcp_starter::store::{Change, Hooks, StoreOptions};
+use mcp_starter::oauth::{Subject, revoke_all, set_password};
+use mcp_starter::store::{Change, Hooks, StoreOptions, Token, TokenKind};
 use mcp_starter::test_support::oauth_flow::{
     CLAUDE_CALLBACK, ISSUER, OAuthRig, OWNER_PASSWORD, VERIFIER, authorize_params, pairs, pkce,
     set_param,
@@ -65,6 +65,7 @@ async fn register() {
 
     for redirect in [
         CLAUDE_CALLBACK,
+        CLAUDE_COM_CALLBACK,
         "https://chatgpt.com/connector_platform_oauth_redirect",
         "https://chatgpt.com/connector/oauth/AbC-12_xyz",
         "http://127.0.0.1:5555/callback",
@@ -91,6 +92,9 @@ async fn register() {
     for bad in [
         "https://evil.example/cb",
         "http://claude.ai/api/mcp/auth_callback",
+        "http://claude.com/api/mcp/auth_callback",
+        "https://claude.com/api/mcp/auth_callback/x",
+        "https://www.claude.com/api/mcp/auth_callback",
         "http://evil.example:5555/cb",
         "https://claude.ai/api/mcp/auth_callback/extra",
         "http://127.0.0.1.evil.example:80/cb",
@@ -351,6 +355,35 @@ async fn authorize_consent_page() {
         "{}",
         reply.header("content-security-policy")
     );
+}
+
+const CLAUDE_COM_CALLBACK: &str = "https://claude.com/api/mcp/auth_callback";
+
+#[tokio::test]
+async fn the_claude_com_callback_completes_the_flow() {
+    let rig = support::rig().await;
+    let client_id = rig.client.register(&[CLAUDE_COM_CALLBACK]).await;
+    let (form, reply) = rig
+        .client
+        .consent(&authorize_params(&INFO, &client_id, CLAUDE_COM_CALLBACK))
+        .await;
+
+    assert!(reply.body.contains(CLAUDE_COM_CALLBACK), "{}", reply.body);
+
+    let approved = rig.client.approve(&form.unwrap(), OWNER_PASSWORD).await;
+
+    assert_eq!(approved.status, 303, "{}", approved.body);
+    assert!(approved.header("location").starts_with(CLAUDE_COM_CALLBACK));
+    assert_eq!(approved.location_param("iss").as_deref(), Some(ISSUER));
+
+    let code = approved.location_param("code").unwrap();
+    let (reply, issued) = rig
+        .client
+        .exchange(&client_id, CLAUDE_COM_CALLBACK, &code, VERIFIER)
+        .await;
+
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(issued.is_some());
 }
 
 #[tokio::test]
@@ -900,6 +933,79 @@ async fn refresh_rotation() {
     );
 }
 
+#[tokio::test]
+async fn verify_returns_the_owner_subject() {
+    let rig = support::rig().await;
+    let (_, issued, _) = rig.client.full_flow().await;
+    let info = rig.oauth.verify(&issued.access_token).await.unwrap();
+
+    assert_eq!(info.subject, Subject::owner());
+    assert_eq!(info.subject.id, "owner");
+}
+
+#[tokio::test]
+async fn refresh_keeps_the_subject() {
+    let rig = support::rig().await;
+    let client_id = rig.client.register(&[CLAUDE_CALLBACK]).await;
+    let refresh_hash = sha256_hex("seeded-refresh-token");
+    let expires_at = "2099-01-01T00:00:00Z".parse().unwrap();
+
+    rig.store
+        .update(move |state| {
+            state.tokens.insert(
+                refresh_hash,
+                Token {
+                    kind: TokenKind::Refresh,
+                    client_id,
+                    family: "seeded-family".to_string(),
+                    scope: "example".to_string(),
+                    resource: String::new(),
+                    subject: "42".to_string(),
+                    subject_name: "Pat Jones".to_string(),
+                    expires_at,
+                    rotated: false,
+                    extra: Default::default(),
+                },
+            );
+
+            Change::Write(())
+        })
+        .await
+        .unwrap();
+
+    let client_id = rig.state().await.clients.keys().next().unwrap().clone();
+    let (reply, rotated) = rig.client.refresh(&client_id, "seeded-refresh-token").await;
+    let info = rig
+        .oauth
+        .verify(&rotated.unwrap().access_token)
+        .await
+        .unwrap_or_else(|error| panic!("refresh: {} {error}", reply.body));
+
+    assert_eq!(info.subject.id, "42");
+    assert_eq!(info.subject.name, "Pat Jones");
+}
+
+#[tokio::test]
+async fn no_subject_is_written_for_the_owner() {
+    let rig = support::rig().await;
+    let (client_id, issued, _) = rig.client.full_flow().await;
+
+    rig.client.refresh(&client_id, &issued.refresh_token).await;
+
+    let state = std::fs::read_to_string(rig.store.path()).unwrap();
+
+    assert!(!state.contains("subject"), "{state}");
+}
+
+fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 async fn set_token_resource(rig: &OAuthRig<TestState>, resource: &str) {
     let resource = resource.to_string();
 
@@ -1324,6 +1430,43 @@ async fn attempt_queued_across_a_password_change_yields_a_dead_code() {
 
     assert_eq!(reply.error_code(), "invalid_grant", "{}", reply.body);
     assert!(rig.state().await.tokens.is_empty());
+}
+
+#[tokio::test]
+async fn a_revocation_during_a_held_password_check_leaves_no_usable_code() {
+    let rig = support::rig().await;
+    let client_id = rig.client.register(&[CLAUDE_CALLBACK]).await;
+    let (form, _) = rig
+        .client
+        .consent(&authorize_params(&INFO, &client_id, CLAUDE_CALLBACK))
+        .await;
+    let form = form.unwrap();
+
+    rig.probe.hold();
+
+    let client = rig.client.clone();
+    let approving = tokio::spawn(async move { client.approve(&form, OWNER_PASSWORD).await });
+
+    wait_until(
+        Duration::from_secs(5),
+        "the password check to start",
+        || rig.probe.started() >= 1,
+    )
+    .await;
+    rig.oauth.revoke_subject("owner").await.unwrap();
+    rig.probe.release();
+
+    let approved = approving.await.unwrap();
+    let code = approved
+        .location_param("code")
+        .unwrap_or_else(|| panic!("no code ({}): {}", approved.status, approved.body));
+    let (reply, tokens) = rig
+        .client
+        .exchange(&client_id, CLAUDE_CALLBACK, &code, VERIFIER)
+        .await;
+
+    assert_eq!(reply.error_code(), "invalid_grant", "{}", reply.body);
+    assert!(tokens.is_none());
 }
 
 async fn submit_wrong_passwords(

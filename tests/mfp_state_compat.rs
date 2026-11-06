@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use jiff::Timestamp;
 use mcp_starter::ServiceInfo;
-use mcp_starter::oauth::{OAuth, bcrypt_checker};
+use mcp_starter::oauth::{OAuth, SignIn, Subject, bcrypt_checker};
 use mcp_starter::store::{Change, Section, Store, StoreOptions, TokenKind};
 use mcp_starter::test_support::TestClock;
 use mcp_starter::test_support::oauth_flow::{ISSUER, OAuthClient};
@@ -231,7 +231,7 @@ static MFP_INFO: ServiceInfo = ServiceInfo {
 /// The public URL the fixture's tokens were issued under (resource `{FIXTURE_ISSUER}/mcp`).
 const FIXTURE_ISSUER: &str = "https://mfp.example.com";
 
-fn mfp_oauth(store: &Store<MfpSection>, issuer: &str) -> OAuth<MfpSection> {
+fn mfp_oauth(store: &Store<MfpSection>, issuer: &str) -> OAuth<Store<MfpSection>> {
     let clock = TestClock::new("2026-10-24T09:00:00Z");
 
     OAuth::new(
@@ -239,7 +239,7 @@ fn mfp_oauth(store: &Store<MfpSection>, issuer: &str) -> OAuth<MfpSection> {
         store.clone(),
         issuer,
         clock.as_clock(),
-        bcrypt_checker(),
+        SignIn::Password(bcrypt_checker()),
         Work::new(TaskTracker::new()),
     )
 }
@@ -260,6 +260,7 @@ async fn go_fixture_token_verifies() {
     let info = oauth.verify("fixture-access-token-full").await.unwrap();
 
     assert_eq!(info.scope, "mfp");
+    assert_eq!(info.subject, Subject::owner());
     assert!(
         oauth.verify("fixture-refresh-token-full").await.is_err(),
         "a refresh token is not an access token"

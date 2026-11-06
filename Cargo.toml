@@ -1,6 +1,6 @@
 [package]
 name = "mcp-starter"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.99"
 description = "Building blocks for an MCP server: OAuth for one owner or many people, a state file or Postgres, HTTP server, tool helpers"

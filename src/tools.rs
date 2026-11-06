@@ -59,16 +59,31 @@ where
     }
 }
 
-/// A successful result: structured output, and the same JSON after the summary in the text,
-/// because some clients show the model only the text content.
-pub fn success_result(summary: String, output: Value) -> CallToolResult {
+/// A successful result: the summary line then the JSON in the text, and the structured output
+/// with the summary under `_summary`. Clients differ in which one the model sees: some show
+/// only the text, Claude Code shows only the structured output.
+///
+/// `_summary` is added only to an object output that has no `_summary` of its own, and only
+/// when the summary is not empty.
+pub fn success_result(summary: String, mut output: Value) -> CallToolResult {
     let mut result = CallToolResult::structured(Value::Null);
 
     result.content = vec![ContentBlock::text(format!("{summary}\n{output}"))];
+
+    if let Value::Object(fields) = &mut output
+        && !summary.is_empty()
+        && !fields.contains_key(SUMMARY_KEY)
+    {
+        fields.insert(SUMMARY_KEY.to_string(), Value::String(summary));
+    }
+
     result.structured_content = Some(output);
 
     result
 }
+
+/// The key of the summary line in a successful result's structured output.
+pub const SUMMARY_KEY: &str = "_summary";
 
 /// A tool error with a plain message.
 pub fn error_result(message: String) -> CallToolResult {
@@ -247,9 +262,30 @@ mod tests {
 
         assert_ne!(ok.is_error, Some(true));
         assert_eq!(text_of(&ok), "summary\n{\"a\":1}");
-        assert_eq!(ok.structured_content, Some(serde_json::json!({"a": 1})));
+        assert_eq!(
+            ok.structured_content,
+            Some(serde_json::json!({"a": 1, "_summary": "summary"}))
+        );
         assert_eq!(text_of(&failed), "nope");
         assert_eq!(failed.is_error, Some(true));
+    }
+
+    #[test]
+    fn success_result_puts_the_summary_only_into_an_object_without_one() {
+        let own = success_result(
+            "summary".to_string(),
+            serde_json::json!({"_summary": "the tool's own"}),
+        );
+        let empty = success_result(String::new(), serde_json::json!({"a": 1}));
+        let array = success_result("summary".to_string(), serde_json::json!([1]));
+
+        assert_eq!(
+            own.structured_content,
+            Some(serde_json::json!({"_summary": "the tool's own"}))
+        );
+        assert_eq!(empty.structured_content, Some(serde_json::json!({"a": 1})));
+        assert_eq!(array.structured_content, Some(serde_json::json!([1])));
+        assert_eq!(text_of(&array), "summary\n[1]");
     }
 
     #[tokio::test]

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1
+
+- `tools::success_result` (and so `run_tool`) also puts the summary line into the structured
+  output, under `_summary` (`tools::SUMMARY_KEY`). Claude Code shows the model only the
+  structured output, so the summary used to reach it only through clients that show the text.
+  The key is added only to an object output that has no `_summary` of its own, and only when
+  the summary is not empty. The text content is unchanged. A tool that declares an output schema
+  with `additionalProperties: false` must allow `_summary`.
+
 ## 0.2.0
 
 The authorization server now serves many people as well as one owner. A single-owner service

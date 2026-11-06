@@ -68,7 +68,7 @@ async fn echo_returns_text_and_date() {
     assert!(!today.is_error, "{}", today.text);
     assert_eq!(
         today.structured,
-        json!({"text": "hi", "date": "2026-10-24"})
+        json!({"text": "hi", "date": "2026-10-24", "_summary": "Echoed \"hi\" for 2026-10-24."})
     );
     assert!(
         today.text.contains("\"date\":\"2026-10-24\""),

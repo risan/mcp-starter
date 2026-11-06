@@ -306,7 +306,13 @@ async fn authorize_consent_page() {
     assert!(form.is_some());
     assert_eq!(reply.status, 200);
     assert!(reply.body.contains("Claude") && reply.body.contains("claude.ai"));
-    assert!(reply.body.contains(CLAUDE_CALLBACK) && reply.body.contains(&client_id));
+    assert!(
+        reply.body.contains(&format!(
+            "<details><summary>Technical details</summary><p>Callback: <code>{CLAUDE_CALLBACK}</code><br>Client ID: <code>{client_id}</code></p></details>"
+        )),
+        "{}",
+        reply.body
+    );
     assert!(
         reply
             .body

@@ -26,6 +26,7 @@ use super::{
     GrantStore, Granted, NewGrant, NewTokens, Registered, Rotation, Subject, TokenInfo,
     is_for_resource,
 };
+use crate::sentry::Reporter;
 use crate::store::{Client, StoreError};
 
 /// The tables the store needs, for the service to apply to its database. No role, no grants.
@@ -54,6 +55,7 @@ struct Connection {
 #[derive(Clone)]
 pub struct PgStore {
     inner: Arc<Inner>,
+    reporter: Reporter,
 }
 
 struct Inner {
@@ -147,7 +149,17 @@ impl PgStore {
                 #[cfg(feature = "test-support")]
                 seeded: Mutex::new(Default::default()),
             }),
+            reporter: Reporter::default(),
         }
+    }
+
+    /// Reports the store's database failures and timeouts to `reporter` (fingerprint
+    /// `database-error`), on top of the stderr line it always writes. Clones made before this
+    /// call keep reporting to stderr only.
+    pub fn with_reporter(mut self, reporter: Reporter) -> PgStore {
+        self.reporter = reporter;
+
+        self
     }
 
     /// Makes `verify` accept `token` as an access token for `info` without asking the
@@ -224,12 +236,16 @@ impl PgStore {
         match outcome {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(error)) => {
-                eprintln!("grant database error: {}", database_cause(&error));
+                self.reporter.report(
+                    "database-error",
+                    &format!("grant database error: {}", database_cause(&error)),
+                );
 
                 Err(StoreError::message("the grant database failed".to_string()))
             }
             Err(_) => {
-                eprintln!("grant database error: timeout");
+                self.reporter
+                    .report("database-error", "grant database error: timeout");
 
                 Err(StoreError::message(
                     "the grant database did not answer in time".to_string(),

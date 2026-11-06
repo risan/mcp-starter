@@ -38,6 +38,7 @@
 //! | [`tools`] | tool-call helpers for an rmcp handler |
 //! | [`cli`] | the shared commands and the `serve` runner |
 //! | [`runtime`] | the current-thread runtime and exit sequence |
+//! | [`sentry`] | error lines to stderr and, with a DSN, to Sentry |
 //! | `test_support` | rigs and helpers for tests (feature `test-support`) |
 
 #![deny(unsafe_code)]
@@ -52,6 +53,7 @@ pub mod config;
 pub mod http;
 pub mod oauth;
 pub mod runtime;
+pub mod sentry;
 pub mod server;
 pub mod store;
 mod sys;

@@ -289,6 +289,13 @@ async fn the_first_sign_in_shows_the_consent_page() {
         "{}",
         reply.body
     );
+    assert!(
+        reply.body.contains(&format!(
+            "<details><summary>Technical details</summary><p>Callback: <code>{CLAUDE_CALLBACK}</code><br>Client ID: <code>{client_id}</code></p></details>"
+        )),
+        "{}",
+        reply.body
+    );
     assert_eq!(reply.header("x-frame-options"), "DENY");
     assert_eq!(reply.header("cache-control"), "no-store");
     assert!(

@@ -64,7 +64,9 @@ where
 /// only the text, Claude Code shows only the structured output.
 ///
 /// `_summary` is added only to an object output that has no `_summary` of its own, and only
-/// when the summary is not empty.
+/// when the summary is not empty. A tool that declares an output schema must allow an optional
+/// `_summary` string. The text carries the output as the tool returned it, without `_summary`,
+/// since the summary line already leads the text.
 pub fn success_result(summary: String, mut output: Value) -> CallToolResult {
     let mut result = CallToolResult::structured(Value::Null);
 

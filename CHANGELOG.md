@@ -2,6 +2,15 @@
 
 ## 0.3.1
 
+- `mcp_starter::sentry`: `Reporter` writes an error line to stderr and, when built with a
+  `SentryDsn`, sends it to Sentry as an error event in a task of its own, so the caller never
+  waits. It posts to Sentry's envelope endpoint directly, so the `sentry` crate and its second
+  HTTP stack stay out. `Debug` of a `Reporter` or `SentryDsn` never prints the key. At most four
+  reports are on the wire at once (the rest are dropped; stderr still gets every line), a 429
+  pauses reports for its `Retry-After` seconds (60 when absent), and a DSN with a path prefix
+  (`https://key@host/sentry/7`) posts under that prefix.
+- `oauth::postgres::PgStore::with_reporter` reports the store's database failures and timeouts
+  (fingerprint `database-error`) to a `Reporter`. The default is stderr only, as before.
 - The consent pages fold the callback and client id into a closed "Technical details" section,
   so people see the application, its host and their own name first. The upstream consent page
   shows the warning before that section.

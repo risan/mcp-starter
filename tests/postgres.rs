@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use jiff::SignedDuration;
 use mcp_starter::oauth::postgres::PgStore;
 use mcp_starter::oauth::{GrantStore, Granted, OAuth, Registered, SignIn};
+use mcp_starter::sentry::{Reporter, SentryDsn};
 use mcp_starter::test_support::TestClock;
 use mcp_starter::test_support::oauth_flow::{
     CLAUDE_CALLBACK, ISSUER, OAuthClient, TestUpstream, VERIFIER, upstream_routes,
@@ -1025,4 +1026,53 @@ async fn an_exchange_skips_its_prune_when_no_permit_is_free_after_it() {
 
     held.clear();
     checking.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_database_failure_is_reported_to_sentry_without_the_connection_string() {
+    let (sender, mut received) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let router = axum::Router::new()
+        .route(
+            "/api/7/envelope/",
+            axum::routing::post(
+                |axum::extract::State(sender): axum::extract::State<
+                    tokio::sync::mpsc::UnboundedSender<String>,
+                >,
+                 body: String| async move {
+                    sender.send(body).unwrap();
+                },
+            ),
+        )
+        .with_state(sender);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sentry = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let dsn = SentryDsn::parse(&format!("http://key@{sentry}/7")).unwrap();
+    let reporter = Reporter::sentry(
+        mcp_starter::http::client_builder(None).build().unwrap(),
+        dsn,
+        "svc",
+    );
+    let config: tokio_postgres::Config = "postgresql://nobody:secret-pw@127.0.0.1:1/none"
+        .parse()
+        .unwrap();
+    let store = PgStore::new(config, support::postgres::test_roots()).with_reporter(reporter);
+
+    assert!(store.verify(&hash("t"), RESOURCE, now()).await.is_err());
+
+    let envelope = tokio::time::timeout(Duration::from_secs(5), received.recv())
+        .await
+        .expect("the failure reaches Sentry")
+        .unwrap();
+    let event: serde_json::Value = serde_json::from_str(envelope.lines().nth(2).unwrap()).unwrap();
+    let line = event["message"]["formatted"].as_str().unwrap();
+
+    assert_eq!(event["fingerprint"][0], "database-error");
+    assert!(line.starts_with("grant database error: "), "{line}");
+    assert!(!line.contains("secret-pw"), "{line}");
+    assert!(!envelope.contains("secret-pw"), "{envelope}");
 }

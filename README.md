@@ -166,10 +166,10 @@ only under `[dev-dependencies]`:
 
 ```toml
 [dependencies]
-mcp-starter = "0.2.0"            # add features = ["postgres"] for many people
+mcp-starter = "0.3.0"            # add features = ["postgres"] for many people
 
 [dev-dependencies]
-mcp-starter = { version = "0.2.0", features = ["test-support"] }
+mcp-starter = { version = "0.3.0", features = ["test-support"] }
 ```
 
 Moving an existing mfp-mcp-rs onto it: see [MIGRATING.md](MIGRATING.md).

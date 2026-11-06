@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1
+
+- The consent pages fold the callback and client id into a closed "Technical details" section,
+  so people see the application, its host and their own name first. The upstream consent page
+  shows the warning before that section.
+
 ## 0.3.0
 
 - `tools::success_result` (and so `run_tool`) also puts the summary line into the structured

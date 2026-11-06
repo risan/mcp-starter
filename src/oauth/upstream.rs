@@ -17,7 +17,7 @@ use jiff::Timestamp;
 
 use super::authorize::{
     AuthRequest, error_page, escape_html, grant_redirect, page, page_head, redirect,
-    redirect_target, request_warning, security_policy,
+    redirect_target, request_warning, security_policy, technical_details,
 };
 use super::{
     CSRF_TTL, ConsentRecord, GrantStore, OAuth, PasswordChecker, SignInRecord, Subject,
@@ -288,14 +288,13 @@ impl<St: GrantStore> OAuth<St> {
         let mut html = page_head(self.inner.info.display_name);
 
         html.push_str(&format!(
-            "<p>Allow <strong>{}</strong> ({}) to use {} as <strong>{}</strong>?</p>\n<p>Callback: <code>{}</code><br>Client ID: <code>{}</code></p>\n{}\n",
+            "<p>Allow <strong>{}</strong> ({}) to use {} as <strong>{}</strong>?</p>\n{}\n{}",
             escape_html(name),
             escape_html(&host),
             escape_html(self.inner.info.display_name),
             escape_html(&subject.name),
-            escape_html(&pending.request.redirect_uri),
-            escape_html(&client.client_id),
             request_warning(&pending.request.redirect_uri),
+            technical_details(&pending.request.redirect_uri, &client.client_id),
         ));
         html.push_str(&format!(
             "<form method=\"post\" action=\"/authorize\">\n<input type=\"hidden\" name=\"ticket\" value=\"{}\">\n<button type=\"submit\" name=\"decision\" value=\"allow\">Allow</button>\n<button type=\"submit\" name=\"decision\" value=\"cancel\">Cancel</button>\n</form>\n</body></html>",

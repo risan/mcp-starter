@@ -111,7 +111,7 @@ pub(super) fn page_head(display_name: &str) -> String {
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
-<style>body{{font-family:system-ui,sans-serif;max-width:28rem;margin:3rem auto;padding:0 1rem}}input,button{{font-size:1rem;padding:.6rem;width:100%;box-sizing:border-box;margin-top:.6rem}}.warn{{background:#fff3cd;padding:.6rem;border-radius:.3rem}}.err{{color:#b00020}}</style>
+<style>body{{font-family:system-ui,sans-serif;max-width:28rem;margin:3rem auto;padding:0 1rem}}input,button{{font-size:1rem;padding:.6rem;width:100%;box-sizing:border-box;margin-top:.6rem}}.warn{{background:#fff3cd;padding:.6rem;border-radius:.3rem}}.err{{color:#b00020}}details{{margin:.6rem 0;color:#555;font-size:.9rem}}summary{{cursor:pointer}}</style>
 </head><body>
 <h1>{title}</h1>
 "#
@@ -180,6 +180,16 @@ pub(super) fn security_policy(target: Option<&Url>, redirect_host: &str) -> Stri
         Some(url) => format!("{DEFAULT_POLICY} {}://{redirect_host}", url.scheme()),
         None => DEFAULT_POLICY.to_string(),
     }
+}
+
+/// The callback and client id, folded away: most people only need the names above them, and a
+/// careful person can still open it to check where the grant goes.
+pub(super) fn technical_details(redirect_uri: &str, client_id: &str) -> String {
+    format!(
+        "<details><summary>Technical details</summary><p>Callback: <code>{}</code><br>Client ID: <code>{}</code></p></details>\n",
+        escape_html(redirect_uri),
+        escape_html(client_id)
+    )
 }
 
 /// Registration is open, so anyone with a Claude or ChatGPT account can register a client and
@@ -452,13 +462,12 @@ impl<St: GrantStore> OAuth<St> {
         let mut html = page_head(self.inner.info.display_name);
 
         html.push_str(&format!(
-            "<p><strong>{}</strong> (the name the application gave itself) wants access to your {} data.</p>\n<p>It will be sent back to <strong>{}</strong>.</p>\n<p>Callback: <code>{}</code><br>Client ID: <code>{}</code></p>\n",
+            "<p><strong>{}</strong> (the name the application gave itself) wants access to your {} data.</p>\n<p>It will be sent back to <strong>{}</strong>.</p>\n",
             escape_html(name),
             escape_html(self.inner.info.display_name),
             escape_html(&redirect_host),
-            escape_html(&request.redirect_uri),
-            escape_html(&client.client_id)
         ));
+        html.push_str(&technical_details(&request.redirect_uri, &client.client_id));
 
         html.push_str(&request_warning(&request.redirect_uri));
         html.push('\n');
